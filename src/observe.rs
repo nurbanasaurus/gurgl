@@ -93,6 +93,17 @@ pub fn capture(
     // Preflight before taking over the terminal, so a missing-backend error
     // prints normally rather than inside the dashboard's alternate screen.
     preflight(cfg)?;
+    // The server's own launch command is a runtime of the *target*, not of gurgl
+    // (Node for `npx`, Python for `python3`/`uvx`, ...). Check it up front so a
+    // missing one is a clear message, not a silent zero-host capture.
+    if !on_path(&spec.command) {
+        bail!(
+            "server command '{}' not found on PATH. It is the runtime your MCP \
+             server needs (e.g. Node for npx-based servers), not a gurgl \
+             dependency. Install it and retry.",
+            spec.command
+        );
+    }
     let mut reporter = report::reporter_for(mode, &spec.name, cfg.trials);
 
     let mut trials: Vec<Vec<FlowHost>> = Vec::with_capacity(cfg.trials as usize);

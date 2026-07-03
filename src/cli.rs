@@ -64,10 +64,11 @@ pub enum Commands {
         format: String,
     },
 
-    /// Capture egress for a configured server (or --all of them).
+    /// Capture egress for a server (omit the name to capture all of them).
     Watch {
-        /// Server name from gurgl.toml. Omit with --all.
+        /// Server name from gurgl.toml. Omit to capture every configured server.
         server: Option<String>,
+        /// Capture every configured server (the default when no name is given).
         #[arg(long)]
         all: bool,
     },

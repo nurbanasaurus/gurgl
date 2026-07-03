@@ -220,18 +220,17 @@ fn cmd_watch(
     cfg: &Config,
     store: &Store,
     server: Option<&str>,
-    all: bool,
+    _all: bool,
     plain: bool,
 ) -> Result<()> {
-    let targets: Vec<&config::ServerSpec> = if all {
-        cfg.servers.iter().collect()
-    } else if let Some(name) = server {
-        match cfg.server(name) {
+    // A named server watches just that one; bare `gurgl watch` (like `--all`)
+    // watches every server configured in gurgl.toml.
+    let targets: Vec<&config::ServerSpec> = match server {
+        Some(name) => match cfg.server(name) {
             Some(s) => vec![s],
             None => bail!("server '{name}' is not configured in gurgl.toml"),
-        }
-    } else {
-        bail!("specify a server name or pass --all");
+        },
+        None => cfg.servers.iter().collect(),
     };
 
     if targets.is_empty() {

@@ -100,13 +100,13 @@ them by hand if the automatic step couldn't.
 two things: a **sandbox** to run the server in, and **mitmproxy** to observe its
 TLS egress.
 
-> **macOS capture caveat.** mitmproxy intercepts TLS with a local CA that the
-> client must trust. gurgl passes that CA via env vars: **Node** honors
-> `NODE_EXTRA_CA_CERTS` on every platform (so `npx`-based MCP servers capture
-> fine), but the macOS **system `python3` ignores `SSL_CERT_FILE`** and won't
-> trust it, so a server run under `/usr/bin/python3` captures **zero** hosts on
-> macOS. gurgl deliberately does not add its CA to the system trust store. See
-> [THREAT-MODEL.md](THREAT-MODEL.md#capture-fidelity).
+> **Capture caveat (verified).** Capture needs the client to route through the
+> proxy *and* trust gurgl's lab CA (never added to any system trust store). Two
+> real gaps: **Node ignores proxy env vars by default** - gurgl sets
+> `NODE_USE_ENV_PROXY=1`, which fixes it on **Node 24+** but not older Node; and
+> the macOS **system `/usr/bin/python3` ignores `SSL_CERT_FILE`**, so a server
+> run under it captures **zero** hosts (use a python.org/certifi Python). Full
+> table: [THREAT-MODEL.md](THREAT-MODEL.md#capture-fidelity).
 
 ### macOS
 

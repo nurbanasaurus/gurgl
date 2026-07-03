@@ -8,11 +8,14 @@
 //! ## v1 status
 //! `build_argv` (pure command construction) is implemented and tested. Actually
 //! forcing *all* egress through the proxy - rather than relying on the client to
-//! honor `HTTPS_PROXY` - is the hardening step tracked in docs/ROADMAP.md
-//! (`--v1-hardening: transparent redirect`). For cooperating clients (Node/npm,
-//! which honor `HTTPS_PROXY` + `NODE_EXTRA_CA_CERTS`) the env-proxy path already
-//! captures real egress; the transparent-redirect layer closes the gap for
-//! clients that ignore proxy env vars.
+//! honor proxy env vars - is the hardening step tracked in docs/ROADMAP.md
+//! (transparent redirect). Client cooperation varies and is the honest limit of
+//! env-proxy capture: curl and Linux Python honor `HTTPS_PROXY`/`SSL_CERT_FILE`;
+//! Node ignores proxy env by default, so gurgl also sets `NODE_USE_ENV_PROXY=1`
+//! (Node 24+) which makes its http/https client and fetch route through the
+//! proxy (verified). Older runtimes, the macOS system Python, and clients with a
+//! pinned or explicitly-set agent still bypass it until transparent redirect
+//! lands. See docs/THREAT-MODEL.md#capture-fidelity.
 
 use crate::config::{SandboxKind, ServerSpec};
 
@@ -32,14 +35,24 @@ impl ProxyEnv {
     /// (KEY, VALUE) pairs to set in the sandboxed process environment.
     pub fn vars(&self) -> Vec<(String, String)> {
         vec![
+            // Route TLS through the proxy. Both cases: clients differ on which
+            // they read (curl/Python honor either; Node reads both under the
+            // NODE_USE_ENV_PROXY flag below).
             ("HTTPS_PROXY".into(), self.https_proxy.clone()),
             ("HTTP_PROXY".into(), self.https_proxy.clone()),
             ("ALL_PROXY".into(), self.https_proxy.clone()),
-            // Node / npm:
+            ("https_proxy".into(), self.https_proxy.clone()),
+            ("http_proxy".into(), self.https_proxy.clone()),
+            ("all_proxy".into(), self.https_proxy.clone()),
+            // Node ignores proxy env vars by default. This (Node 24+) makes its
+            // core http/https client AND fetch honor them; harmless on older Node.
+            // Verified: without it, node egress bypasses the proxy entirely.
+            ("NODE_USE_ENV_PROXY".into(), "1".into()),
+            // CA trust so the intercepting cert is accepted:
             ("NODE_EXTRA_CA_CERTS".into(), self.ca_cert_path.clone()),
-            // curl / others honoring CA bundles:
             ("SSL_CERT_FILE".into(), self.ca_cert_path.clone()),
             ("REQUESTS_CA_BUNDLE".into(), self.ca_cert_path.clone()),
+            ("CURL_CA_BUNDLE".into(), self.ca_cert_path.clone()),
             // gurgl addon coordination:
             ("GURGL_FLOWOUT".into(), self.flowout_path.clone()),
         ]

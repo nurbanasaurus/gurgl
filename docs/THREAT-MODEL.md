@@ -72,28 +72,35 @@ capture is **non-coverage**, not a clean bill of health.
 
 ## Capture fidelity
 
-TLS interception only works if the **client trusts gurgl's lab CA**. gurgl never
-installs that CA in a system trust store (it lives only under `~/.gurgl`);
-instead it injects it into the sandboxed server's environment. So whether a
-client is captured depends on whether that client honors the relevant env var:
+Env-proxy capture needs **two** things from the client, and gurgl injects both
+into the sandboxed server's environment (never into a system store): the client
+must **route** through the proxy (`HTTPS_PROXY`) and must **trust** gurgl's lab
+CA (`NODE_EXTRA_CA_CERTS` / `SSL_CERT_FILE` / ...). A client that ignores either
+is not captured. This was measured, not assumed:
 
-| Client | CA env var it honors | Captured? |
-|--------|----------------------|-----------|
-| Node (`npx` MCP servers) | `NODE_EXTRA_CA_CERTS` | yes, all platforms |
-| Linux `python3` (urllib/requests) | `SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE` | yes |
-| curl | `CURL_CA_BUNDLE` / `SSL_CERT_FILE` | yes |
-| **macOS system `/usr/bin/python3`** | ignores `SSL_CERT_FILE` | **no - captures 0 hosts** |
+| Client | Routes through proxy? | Trusts CA? | Captured? |
+|--------|-----------------------|------------|-----------|
+| curl | `HTTPS_PROXY` yes | `SSL_CERT_FILE`/`CURL_CA_BUNDLE` yes | yes |
+| Linux `python3` (urllib/requests) | `HTTPS_PROXY` yes | `SSL_CERT_FILE` yes | yes |
+| Node 24+ (`https`, `fetch`) | **only with `NODE_USE_ENV_PROXY=1`** | `NODE_EXTRA_CA_CERTS` yes | yes (gurgl sets that flag) |
+| Node without the flag | ignores `HTTPS_PROXY` | - | **no - bypasses the proxy** |
+| macOS system `/usr/bin/python3` | `HTTPS_PROXY` yes | ignores `SSL_CERT_FILE` | **no - TLS verify fails** |
 
-The macOS system Python (3.9, LibreSSL) does not consult `SSL_CERT_FILE`, so a
-server run under it fails the TLS handshake to the proxy and its egress is never
-recorded. Most published MCP servers are Node-based and capture fine; a
-Python-based server on macOS needs a Python that honors the CA env (e.g. a
-python.org build or one that uses `certifi`), or it won't be observed. A client
-that opens raw sockets or pins its certificate also escapes capture. The tracked
-hardening step (network namespace + transparent redirect) forces *routing*
-through the proxy but does not change this: TLS capture always requires the
-client to trust the CA. Report coverage gaps honestly rather than reading
-silence as safety.
+Two verified gotchas worth stating plainly:
+
+- **Node ignores proxy env vars by default.** Both `https.get` and `fetch`
+  connect *directly*, bypassing the proxy, so gurgl would see nothing. Node 24
+  added `NODE_USE_ENV_PROXY=1`, which makes its core http/https client and fetch
+  honor `HTTPS_PROXY`; gurgl sets it, so Node 24+ MCP servers are captured. On
+  older Node, or with a library that sets its own agent, egress still bypasses.
+- **The macOS system Python (3.9, LibreSSL) ignores `SSL_CERT_FILE`,** so a
+  server run under `/usr/bin/python3` fails the TLS handshake to the proxy and
+  captures zero hosts. Use a Python that honors the CA env (python.org / certifi).
+
+A client that opens raw sockets or pins its certificate also escapes capture.
+The tracked hardening step (network namespace + transparent redirect) forces
+*routing* for everyone, but trust still requires the CA. Report coverage gaps
+honestly rather than reading silence as safety.
 
 ## The one-line summary to keep in your head
 

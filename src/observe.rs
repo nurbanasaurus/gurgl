@@ -166,10 +166,14 @@ pub fn capture(
     let mut reporter = report::reporter_for(mode, &spec.name, trial_count);
 
     let mut trials: Vec<Vec<FlowHost>> = Vec::with_capacity(trial_count as usize);
+    let mut reported_version: Option<String> = None;
     for i in 1..=trial_count {
         reporter.trial_start(i, trial_count);
-        let hosts = run_trial(cfg, spec, plan, i, monitor, reporter.as_mut())
+        let (hosts, ver) = run_trial(cfg, spec, plan, i, monitor, reporter.as_mut())
             .with_context(|| format!("trial {i} of {}", spec.name))?;
+        if reported_version.is_none() {
+            reported_version = ver;
+        }
         let uniq: std::collections::BTreeSet<&String> = hosts.iter().map(|h| &h.host).collect();
         reporter.trial_end(i, uniq.len());
         trials.push(hosts);
@@ -181,12 +185,21 @@ pub fn capture(
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
+    // Version precedence: an explicit config value, else what the server reports
+    // in its MCP `initialize` response (`serverInfo.version`), else "unknown".
+    // A real version is what makes distinct snapshots (and therefore `diff`)
+    // possible instead of everything collapsing to unknown.json.
+    let version = spec
+        .version
+        .clone()
+        .or(reported_version)
+        .map(|v| sanitize_version(&v))
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+
     let snapshot = Snapshot {
         server: spec.name.clone(),
-        version: spec
-            .version
-            .clone()
-            .unwrap_or_else(|| "unknown".to_string()),
+        version,
         captured_at,
         trials: trial_count,
         flightplan: plan.fingerprint(),
@@ -208,7 +221,8 @@ impl Drop for KillOnDrop {
 }
 
 /// Run one trial: start the proxy, launch the sandboxed server through it, drive
-/// the flight plan over stdio, then read back the observed hosts.
+/// the flight plan over stdio, then read back the observed hosts. Returns the
+/// hosts and the server's self-reported version (from `initialize`), if any.
 fn run_trial(
     cfg: &Config,
     spec: &ServerSpec,
@@ -216,7 +230,7 @@ fn run_trial(
     trial: u32,
     monitor: Monitor,
     reporter: &mut dyn Reporter,
-) -> Result<Vec<FlowHost>> {
+) -> Result<(Vec<FlowHost>, Option<String>)> {
     // Per-trial scratch (its own flow file + addon copy).
     let tmp = std::env::temp_dir().join(format!(
         "gurgl-{}-{}-{}",
@@ -295,6 +309,8 @@ fn run_trial(
     let mut phase_marks: Vec<(f64, String)> = Vec::new();
     let mut id: u64 = 0;
     let mut chosen_tool: Option<String> = None;
+    // The server's self-reported version from its `initialize` response.
+    let mut server_version: Option<String> = None;
     // Hosts already surfaced to the reporter this trial (so the live view shows
     // each once as it first appears).
     let mut surfaced: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
@@ -306,7 +322,14 @@ fn run_trial(
             "initialize" => {
                 id += 1;
                 send(&mut stdin, &mcp::initialize(id));
-                let _ = read_response(&rx, id, Duration::from_secs(20));
+                if let Some(resp) = read_response(&rx, id, Duration::from_secs(20)) {
+                    server_version = resp
+                        .get("result")
+                        .and_then(|r| r.get("serverInfo"))
+                        .and_then(|s| s.get("version"))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                }
                 send(&mut stdin, &mcp::initialized());
             }
             "tools/list" => {
@@ -398,7 +421,22 @@ fn run_trial(
     let raw = proxy::parse_flows(&flows_path)?;
     let hosts = attribute_phases(raw, &phase_marks);
     let _ = std::fs::remove_dir_all(&tmp);
-    Ok(hosts)
+    Ok((hosts, server_version))
+}
+
+/// Make a server-reported version safe to use as a snapshot filename, keeping
+/// version-y characters and replacing anything else.
+fn sanitize_version(v: &str) -> String {
+    v.trim()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '+') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
 }
 
 /// Read the flow file mid-capture and hand any not-yet-seen hosts to the

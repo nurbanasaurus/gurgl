@@ -298,15 +298,41 @@ fn cmd_watch(
         report::Mode::Dashboard
     };
 
+    // Capture each target independently: one un-runnable server (missing runtime,
+    // a plugin that needs its client's env) must not abort the whole batch.
+    let multi = targets.len() > 1;
+    let mut captured = 0usize;
+    let mut skipped: Vec<String> = Vec::new();
     for spec in targets {
-        let snap = observe::capture(cfg, spec, &plan, mode, monitor)?;
-        let path = store.save(&snap)?;
-        println!(
-            "saved {}@{} -> {}",
-            snap.server,
-            snap.version,
-            path.display()
-        );
+        match observe::capture(cfg, spec, &plan, mode, monitor).and_then(|snap| {
+            let path = store.save(&snap)?;
+            Ok((path, snap))
+        }) {
+            Ok((path, snap)) => {
+                println!(
+                    "saved {}@{} -> {}",
+                    snap.server,
+                    snap.version,
+                    path.display()
+                );
+                captured += 1;
+            }
+            Err(e) => {
+                eprintln!("skipped {}: {:#}", spec.name, e);
+                skipped.push(spec.name.clone());
+            }
+        }
+    }
+
+    if multi {
+        print!("\n{captured} captured");
+        if !skipped.is_empty() {
+            print!(", {} skipped: {}", skipped.len(), skipped.join(", "));
+        }
+        println!();
+    }
+    if captured == 0 {
+        bail!("no servers were captured (see the messages above)");
     }
     Ok(())
 }
@@ -411,7 +437,6 @@ fn cmd_discover(import: bool) -> Result<()> {
         );
     }
 
-    let stdio: Vec<&discover::Discovered> = found.iter().filter(|d| d.is_stdio()).collect();
     if !import {
         println!(
             "\nto watch these, add the stdio ones to {} (or re-run with --import),\n\
@@ -420,11 +445,39 @@ fn cmd_discover(import: bool) -> Result<()> {
         );
         return Ok(());
     }
-    if stdio.is_empty() {
-        println!("\nnothing to import: no local stdio servers found.");
+
+    // Only import servers gurgl can actually launch. Skip those that reference a
+    // client runtime variable (e.g. ${CLAUDE_PLUGIN_ROOT}): only their client
+    // expands it, so gurgl - which runs the command directly - cannot start them.
+    let (runnable, client_only): (Vec<&discover::Discovered>, Vec<&discover::Discovered>) = found
+        .iter()
+        .filter(|d| d.is_stdio())
+        .partition(|d| !references_client_runtime(d));
+
+    if !client_only.is_empty() {
+        println!(
+            "\nnot importing {} server(s) that only run inside their client (they reference a\n\
+             runtime variable like ${{CLAUDE_PLUGIN_ROOT}} gurgl cannot expand): {}",
+            client_only.len(),
+            client_only
+                .iter()
+                .map(|d| d.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    if runnable.is_empty() {
+        println!("\nnothing to import: no directly-runnable stdio servers found.");
         return Ok(());
     }
-    import_servers(&stdio)
+    import_servers(&runnable)
+}
+
+/// Whether a server's launch references a client-provided runtime variable (e.g.
+/// `${CLAUDE_PLUGIN_ROOT}`) that only its client expands - gurgl cannot run it.
+fn references_client_runtime(d: &discover::Discovered) -> bool {
+    let has_var = |s: &str| s.contains("${");
+    d.command.as_deref().map(has_var).unwrap_or(false) || d.args.iter().any(|a| has_var(a))
 }
 
 /// Append discovered stdio servers to gurgl.toml, skipping any already present.

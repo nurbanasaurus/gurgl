@@ -307,8 +307,16 @@ fn render(s: &DashState) -> String {
     }
     push_line(&mut b, "");
 
-    // Phase timings for the current trial.
+    // Phase timings for the current trial. Column width follows the longest
+    // phase name so custom plans (e.g. "fetch-example") stay aligned.
     push_line(&mut b, &format!("  {DIM}phases{RESET}"));
+    let name_w = s
+        .phases
+        .iter()
+        .map(|p| p.name.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(12);
     for p in &s.phases {
         let d = if p.active {
             fmt_secs(s.phase_start.elapsed())
@@ -321,7 +329,10 @@ fn render(s: &DashState) -> String {
             " ".to_string()
         };
         let name = &p.name;
-        push_line(&mut b, &format!("    {name:<12} {DIM}{d:>6}{RESET} {mark}"));
+        push_line(
+            &mut b,
+            &format!("    {name:<name_w$} {DIM}{d:>6}{RESET} {mark}"),
+        );
     }
     push_line(&mut b, "");
 

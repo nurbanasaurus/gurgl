@@ -1,0 +1,50 @@
+# Demo flight plan: watch real egress live.
+#
+# Pair it with a fetch-capable MCP server (no API key needed), e.g. in gurgl.toml:
+#
+#   [[servers]]
+#   name = "fetch"
+#   command = "npx"
+#   args = ["-y", "@tokenizin/mcp-npx-fetch"]
+#   flightplan = "flightplans/fetch-demo.toml"
+#
+# Then `gurgl watch fetch` (or --until-closed) shows hosts streaming in phase by
+# phase: the npm registry at startup, then each fetched URL - including any
+# redirect hops the server follows that this plan never named.
+#
+# Edit the URLs to point at whatever you want to exercise. Changing args changes
+# the flight-plan fingerprint, so snapshots stay bound to the method that
+# produced them. Keep the tools read-only.
+
+name = "fetch-demo"
+
+[[steps]]
+phase = "startup"
+action = "initialize"
+
+[[steps]]
+phase = "enumerate"
+action = "tools/list"
+
+[[steps]]
+phase = "fetch-example"
+action = "tools/call"
+tool = "fetch_txt"
+args = { url = "https://example.com" }
+
+[[steps]]
+phase = "fetch-github"
+action = "tools/call"
+tool = "fetch_json"
+args = { url = "https://api.github.com/meta" }
+
+[[steps]]
+phase = "fetch-rust"
+action = "tools/call"
+tool = "fetch_txt"
+args = { url = "https://www.rust-lang.org" }
+
+[[steps]]
+phase = "idle"
+action = "sleep"
+seconds = 6

@@ -227,6 +227,11 @@ cleanly on Ctrl-C and still saves what it captured. Because these are a single
 observation, everything is recorded as seen 1/1 - use the default battery when
 you want the reproduction gate.
 
+For a live demo with real egress, see
+[flightplans/fetch-demo.toml](flightplans/fetch-demo.toml): pair it with a
+no-key fetch MCP server and watch hosts stream in phase by phase, including
+redirect hops the plan never named.
+
 ## Where things live: `~/.gurgl`
 
 ```

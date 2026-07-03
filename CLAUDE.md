@@ -30,7 +30,10 @@ make gurgl better - it makes it dishonest and legally exposed.
 4. **Hosts, not payloads.** gurgl records DNS host names only. Do not add
    body/content capture. That's a different, far more fraught tool.
 5. **Local-first, no telemetry.** gurgl must never phone home. No analytics, no
-   "anonymous usage stats", no auto-update pings.
+   "anonymous usage stats", no auto-update pings. `gurgl update` is allowed
+   because it is *explicit and user-invoked* (a manual `git pull` + reinstall) -
+   it must never become an automatic check, a startup ping, or a background
+   fetch. The only network access on update is the git fetch the user triggered.
 6. **The trusted-channel limit is acknowledged, not hidden.** gurgl cannot see
    exfiltration riding a legitimately-used host, and cannot see anything
    server-side. THREAT-MODEL.md states this plainly; keep it accurate.
@@ -58,8 +61,12 @@ gurgl installs into one self-contained home, `~/.gurgl` (override with
 `mitmproxy/` (the lab CA), and `env` (a sourceable PATH shim). `install.sh` does
 `cargo install --root ~/.gurgl`; `gurgl init` lays down the config + the embedded
 default flight plan + the store. Config discovery: `--config`, else
-`./gurgl.toml`, else `~/.gurgl/gurgl.toml`, else defaults. There is **no
-self-updater** (constraint #5) - updating is `make update` (git pull + reinstall).
+`./gurgl.toml`, else `~/.gurgl/gurgl.toml`, else defaults. Updating is
+explicit and user-invoked only (constraint #5): `gurgl update` / `gurgl -u`
+maintains a managed checkout at `~/.gurgl/src` and reinstalls from it (works even
+on a `make deploy`ed box with no local `.git`); `make update` does the same from
+a source clone. There is **no auto-update** - gurgl never checks or fetches on
+its own.
 Path helpers live in `config.rs` (`gurgl_home()`, `default_config_path()`,
 `DEFAULT_FLIGHTPLAN`); don't hardcode paths elsewhere.
 

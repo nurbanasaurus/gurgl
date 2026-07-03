@@ -197,6 +197,26 @@ $ gurgl allow filesystem-mcp --format sandbox-runtime > allow.txt
 An allowlist reflects only what was **observed** under the flight plan - it is a
 starting point to review, not a complete contract.
 
+### `gurgl update`
+
+`gurgl update` (or `gurgl -u` / `gurgl --update`) - update gurgl from the public
+repo and reinstall. It runs **only when you invoke it**; gurgl never checks for,
+pings about, or downloads updates on its own (constraint #5). The only network
+access is the git fetch you just asked for.
+
+```console
+$ gurgl update
+>> updating gurgl source in /home/you/.gurgl/src ...
+>> building + installing the update ...
+gurgl is up to date. Check `gurgl --version`.
+```
+
+It maintains a managed checkout at `~/.gurgl/src` and reinstalls from it, so it
+works the same on any machine - including one set up with `make deploy`, which has
+no git checkout of its own to pull. Requires `git` and a compiler toolchain (the
+installer bootstraps Rust if it is missing). If you work from a source clone,
+`make update` does the same thing from that clone.
+
 ---
 
 ## The config file (`gurgl.toml`)

@@ -211,19 +211,23 @@ Override the location with `$GURGL_HOME`. Uninstall is `rm -rf ~/.gurgl`.
 
 ## Updating
 
-gurgl **never self-updates** - a security tool that makes no network calls of
-its own shouldn't phone home for updates either (see constraint #5 in
-[CLAUDE.md](CLAUDE.md)). Updating is explicit: pull the source and reinstall.
+gurgl updates **only when you ask it to**. It never checks for, pings about, or
+downloads updates on its own - a security tool that makes no network calls of its
+own shouldn't phone home for updates either (constraint #5 in
+[CLAUDE.md](CLAUDE.md)). When you run the command below, the only network access
+is the git fetch you just triggered.
 
 ```sh
-cd gurgl && make update      # git pull --ff-only && ./install.sh
+gurgl update      # or: gurgl -u  /  gurgl --update
 ```
 
-To update a remote machine you deploy to (e.g. over Tailscale/SSH):
+This pulls the latest source into a managed checkout at `~/.gurgl/src`, rebuilds,
+and reinstalls into `~/.gurgl`. It works the same on any machine, including one
+set up with `make deploy` (which has no local git checkout of its own). Requires
+`git` and a compiler toolchain (the installer bootstraps Rust if missing).
 
-```sh
-make deploy HOST=my-mac      # rsync latest source, rebuild + reinstall natively there
-```
+Working from a source clone instead? `make update` (git pull + reinstall) and
+`make deploy HOST=my-mac` (push to a remote over SSH/Tailscale) still work.
 
 ## Command reference
 
@@ -236,6 +240,7 @@ make deploy HOST=my-mac      # rsync latest source, rebuild + reinstall natively
 | `gurgl watch [<server>] [--all]` | Capture egress behind the proxy (needs mitmproxy + sandbox). |
 | `gurgl diff <server> [--from --to]` | Diff egress between two versions (default: latest two). |
 | `gurgl allow <server> [--format ...]` | Emit an allowlist (`sandbox-runtime` / `opensnitch` / `squid`). |
+| `gurgl update` (`-u`, `--update`) | Pull the latest source and reinstall. Runs only when invoked; no auto-update. |
 
 Global flags: `--config <path>` (else `./gurgl.toml`, else `~/.gurgl/gurgl.toml`),
 `--store <dir>`, `--plain` (disable the live dashboard). Every flag, the config

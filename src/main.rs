@@ -33,25 +33,41 @@ use crate::store::Store;
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // `-u`/`--update` and `gurgl update` are the same explicit, user-invoked
+    // update. Handle it before touching config/store (neither is needed) and
+    // before anything else, so it works from a bare `gurgl -u`.
+    if cli.update || matches!(cli.command, Some(Commands::Update)) {
+        return cmd_update();
+    }
+
     let cfg = load_config(&cli)?;
     let store = build_store(&cli, &cfg)?;
 
     match &cli.command {
-        Commands::Init => cmd_init(&store),
-        Commands::List => cmd_list(&store),
-        Commands::Show { server, version } => cmd_show(&store, server, version.as_deref()),
-        Commands::Diff { server, from, to } => {
+        None => {
+            // No subcommand: show help rather than erroring.
+            use clap::CommandFactory;
+            Cli::command().print_help().ok();
+            println!();
+            Ok(())
+        }
+        Some(Commands::Update) => unreachable!("handled above"),
+        Some(Commands::Init) => cmd_init(&store),
+        Some(Commands::List) => cmd_list(&store),
+        Some(Commands::Show { server, version }) => cmd_show(&store, server, version.as_deref()),
+        Some(Commands::Diff { server, from, to }) => {
             cmd_diff(&store, server, from.as_deref(), to.as_deref())
         }
-        Commands::Allow {
+        Some(Commands::Allow {
             server,
             version,
             format,
-        } => cmd_allow(&store, server, version.as_deref(), format),
-        Commands::Watch { server, all } => {
+        }) => cmd_allow(&store, server, version.as_deref(), format),
+        Some(Commands::Watch { server, all }) => {
             cmd_watch(&cfg, &store, server.as_deref(), *all, cli.plain)
         }
-        Commands::Discover { import } => cmd_discover(*import),
+        Some(Commands::Discover { import }) => cmd_discover(*import),
     }
 }
 
@@ -379,6 +395,66 @@ fn import_servers(stdio: &[&discover::Discovered]) -> Result<()> {
     std::fs::write(&path, &text).with_context(|| format!("writing {}", path.display()))?;
     println!("\nimported {added} server(s) into {}.", path.display());
     println!("run `gurgl watch` to capture them all, or `gurgl watch <name>` for one.");
+    Ok(())
+}
+
+/// Update gurgl from the public repository and reinstall. This runs ONLY when
+/// the user invokes it (`gurgl update` / `gurgl -u`); gurgl never checks for,
+/// pings about, or downloads updates on its own (constraint #5: no phone-home,
+/// no auto-update). The only network access is the explicit git fetch below.
+///
+/// It keeps a managed checkout at `~/.gurgl/src` and reinstalls from it, so it
+/// works the same whether gurgl was git-cloned or rsync-deployed (a machine set
+/// up via `make deploy` has no .git of its own to pull).
+fn cmd_update() -> Result<()> {
+    use std::process::Command;
+    const REPO: &str = "https://github.com/nurbanasaurus/gurgl.git";
+
+    let home = config::gurgl_home();
+    let src = home.join("src");
+
+    if src.join(".git").is_dir() {
+        println!(">> updating gurgl source in {} ...", src.display());
+        run(Command::new("git")
+            .arg("-C")
+            .arg(&src)
+            .args(["pull", "--ff-only"]))?;
+    } else {
+        std::fs::create_dir_all(&home).with_context(|| format!("creating {}", home.display()))?;
+        if src.exists() {
+            std::fs::remove_dir_all(&src).with_context(|| format!("clearing {}", src.display()))?;
+        }
+        println!(">> fetching gurgl from {REPO} ...");
+        run(Command::new("git").arg("clone").arg(REPO).arg(&src))?;
+    }
+
+    println!(">> building + installing the update ...");
+    run(Command::new("bash")
+        .arg(src.join("install.sh"))
+        .arg("--no-modify-path")
+        .current_dir(&src))?;
+
+    println!("\ngurgl is up to date. Check `gurgl --version`.");
+    Ok(())
+}
+
+/// Run a subprocess inheriting stdio, with clear errors when the tool is missing
+/// or the command fails.
+fn run(cmd: &mut std::process::Command) -> Result<()> {
+    let program = cmd.get_program().to_string_lossy().to_string();
+    let status = cmd.status().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            anyhow::anyhow!("`{program}` is required but was not found on PATH")
+        } else {
+            anyhow::Error::from(e).context(format!("running `{program}`"))
+        }
+    })?;
+    if !status.success() {
+        bail!(
+            "`{program}` failed with exit {}",
+            status.code().unwrap_or(-1)
+        );
+    }
     Ok(())
 }
 

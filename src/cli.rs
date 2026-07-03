@@ -28,8 +28,12 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub plain: bool,
 
+    /// Update gurgl from the public repo and reinstall (same as `gurgl update`).
+    #[arg(short = 'u', long = "update", global = true)]
+    pub update: bool,
+
     #[command(subcommand)]
-    pub command: Commands,
+    pub command: Option<Commands>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -79,4 +83,8 @@ pub enum Commands {
         #[arg(long)]
         import: bool,
     },
+
+    /// Update gurgl from the public repo and reinstall. Runs only when you ask;
+    /// gurgl never checks for or fetches updates on its own.
+    Update,
 }

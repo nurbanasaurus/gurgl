@@ -2,9 +2,15 @@
 //!
 //! Every MCP client stores its servers in a predictable JSON config with an
 //! `mcpServers` object (`{ "name": { "command", "args", "env" } }`). gurgl scans
-//! the well-known locations (Claude Desktop, Claude Code, Cursor, Windsurf,
-//! Cline) so you can see, and then watch, the servers you actually run rather
-//! than hand-listing them.
+//! two ways so you can see, and then watch, the servers you actually run rather
+//! than hand-listing them:
+//!
+//! 1. the well-known client config files (Claude Desktop, Claude Code's
+//!    `~/.claude.json`, Cursor, Windsurf, Cline); and
+//! 2. every project-scoped `.mcp.json` under `$HOME` (Claude Code's per-project
+//!    config, and where plugins ship theirs). Matching that exact filename keeps
+//!    this precise - unrelated JSON that merely mentions `mcpServers` (schemas,
+//!    API discovery docs) is not named `.mcp.json`, so it is not picked up.
 //!
 //! This only reads config files; it never records or prints `env` values (which
 //! commonly hold API keys). It reports *that* a server sets env, not what.
@@ -92,19 +98,126 @@ fn config_files() -> Vec<(&'static str, PathBuf)> {
     v
 }
 
-/// Scan every known config file and return the MCP servers found.
+/// Scan the known config files plus every project-scoped `.mcp.json`, and return
+/// the MCP servers found.
 pub fn discover() -> Vec<Discovered> {
     let mut out = Vec::new();
+
+    // 1) the well-known client config files (fixed locations).
     for (label, path) in config_files() {
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(json) = serde_json::from_str::<Value>(&text) else {
-            continue;
-        };
-        collect(&json, label, &path, &mut out);
+        parse_file(&path, label, &mut out);
     }
+
+    // 2) project-scoped `.mcp.json` files anywhere under $HOME (and the current
+    // dir). This is where Claude Code keeps per-project MCP servers, and where
+    // plugins ship theirs; the fixed list above never sees them.
+    for path in project_mcp_files() {
+        let label = label_for(&path);
+        parse_file(&path, label, &mut out);
+    }
+
+    // A server can surface from more than one file (e.g. a plugin present in both
+    // the install cache and the marketplace). Keep the first, drop exact dupes.
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|d| {
+        seen.insert((
+            d.name.clone(),
+            d.command.clone(),
+            d.url.clone(),
+            d.args.clone(),
+        ))
+    });
     out
+}
+
+/// Read one JSON config file and append any MCP servers it defines.
+fn parse_file(path: &Path, label: &str, out: &mut Vec<Discovered>) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(json) = serde_json::from_str::<Value>(&text) else {
+        return;
+    };
+    collect(&json, label, path, out);
+}
+
+/// Recursively find files named exactly `.mcp.json` under `$HOME` and the
+/// current directory, pruning heavy or irrelevant directories and bounding depth
+/// so this stays fast on a large home. macOS `~/Library` is pruned (the Claude
+/// Desktop config there is already a fixed location above and is not a
+/// `.mcp.json`).
+fn project_mcp_files() -> Vec<PathBuf> {
+    const PRUNE: &[&str] = &[
+        "node_modules",
+        ".git",
+        "target",
+        "Library",
+        "Caches",
+        ".cargo",
+        ".rustup",
+        ".cache",
+        ".npm",
+        ".venv",
+        "venv",
+        "dist",
+        "build",
+        ".Trash",
+        ".gurgl",
+        "mitmproxy-venv",
+        "site-packages",
+    ];
+    const MAX_DEPTH: usize = 8;
+    const MAX_DIRS: usize = 50_000;
+
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        roots.push(home);
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        if !roots.iter().any(|r| cwd.starts_with(r)) {
+            roots.push(cwd);
+        }
+    }
+
+    let mut found = Vec::new();
+    let mut stack: Vec<(PathBuf, usize)> = roots.into_iter().map(|r| (r, 0)).collect();
+    let mut visited = 0usize;
+    while let Some((dir, depth)) = stack.pop() {
+        if depth > MAX_DEPTH {
+            continue;
+        }
+        visited += 1;
+        if visited > MAX_DIRS {
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            if ft.is_dir() {
+                let name = entry.file_name();
+                if PRUNE.iter().any(|p| name == std::ffi::OsStr::new(p)) {
+                    continue;
+                }
+                stack.push((entry.path(), depth + 1));
+            } else if entry.file_name().to_str() == Some(".mcp.json") {
+                found.push(entry.path());
+            }
+        }
+    }
+    found
+}
+
+/// A short source label for a discovered `.mcp.json`, by where it lives.
+fn label_for(path: &Path) -> &'static str {
+    if path.to_string_lossy().contains("/plugins/") {
+        "plugin"
+    } else {
+        "project"
+    }
 }
 
 fn collect(json: &Value, label: &str, path: &Path, out: &mut Vec<Discovered>) {

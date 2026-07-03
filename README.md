@@ -142,12 +142,15 @@ example-mcp: 1.2.0 -> 1.3.0
 
 ```sh
 gurgl init                 # writes ~/.gurgl/gurgl.toml + the default flight plan
-$EDITOR ~/.gurgl/gurgl.toml # list the MCP servers you actually run
+gurgl discover --import    # find the MCP servers already on this machine, add them
 gurgl watch --all          # capture each, N trials, behind the proxy
 gurgl show <server>        # the hosts it contacted, by class + reproducibility
 gurgl diff <server>        # compare the two most recent versions
 gurgl allow <server> --format sandbox-runtime > allow.txt
 ```
+
+Prefer to list servers yourself? Edit `~/.gurgl/gurgl.toml` by hand instead of
+`discover --import`; the format is in [docs/USAGE.md](docs/USAGE.md).
 
 `gurgl show` after a capture looks like this (a real run against a server that
 fetches two hosts at startup and one on the tool call):
@@ -159,6 +162,27 @@ api.github.com                           registry     stable       2/2
 example.com                              first-party  stable       2/2
 example.org                              unknown      stable       2/2
 ```
+
+### Finding your servers: `gurgl discover`
+
+You do not have to hand-list servers. `gurgl discover` scans the standard MCP
+client configs on this machine - Claude Desktop, Claude Code (`~/.claude.json`),
+Cursor, Windsurf, and Cline - and shows what it finds:
+
+```
+found 3 MCP server(s) configured on this machine:
+
+NAME                   KIND    COMMAND                            SOURCE
+filesystem             stdio   npx -y @modelcontextprotocol/se... Claude Code (~/.claude.json)
+github                 stdio   npx -y @modelcontextprotocol/se... Cursor (~/.cursor/mcp.json) [env]
+linear-remote          remote  https://mcp.linear.app/sse         Cursor (~/.cursor/mcp.json)
+```
+
+`--import` appends the local `stdio` servers to your `gurgl.toml` so `gurgl watch`
+can capture them. It is safe to re-run (it skips servers already listed). Two
+honest limits it calls out inline: `remote` (url) servers are inventory only -
+gurgl watches local subprocesses, not remote HTTP/SSE endpoints - and `[env]`
+servers set their own environment (often API keys), which gurgl does not copy.
 
 ### Live dashboard
 
@@ -206,6 +230,7 @@ make deploy HOST=my-mac      # rsync latest source, rebuild + reinstall natively
 | Command | What it does |
 |---------|--------------|
 | `gurgl init` | Create `~/.gurgl` (config, default flight plan, store). |
+| `gurgl discover [--import]` | Find MCP servers configured on this machine; `--import` adds the stdio ones to `gurgl.toml`. |
 | `gurgl list` | List captured servers and versions. |
 | `gurgl show <server> [version]` | Show observed hosts for a version (default: latest). |
 | `gurgl watch [<server>] [--all]` | Capture egress behind the proxy (needs mitmproxy + sandbox). |

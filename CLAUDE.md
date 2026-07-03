@@ -74,6 +74,9 @@ Path helpers live in `config.rs` (`gurgl_home()`, `default_config_path()`,
 - `store.rs` - JSON snapshots at `<store>/<server>/<version>.json`.
 - `sandbox.rs` / `proxy.rs` - `build_argv()` (pure, tested) + spawn helpers.
 - `flightplan.rs` - parse/fingerprint the scripted battery.
+- `discover.rs` - scan known MCP client configs (Claude Desktop/Code, Cursor,
+  Windsurf, Cline) for configured servers; `--import` appends stdio ones to
+  `gurgl.toml`. Read-only on client configs; never reads `env` values.
 - `mcp.rs` - minimal MCP JSON-RPC message builders.
 - `report.rs` - `Reporter` trait + `PlainReporter` (piped/`--plain`) and
   `DashboardReporter` (live ANSI dashboard, no deps, TTY-gated). `watch` only.

@@ -7,6 +7,7 @@
 mod cli;
 mod config;
 mod diff;
+mod discover;
 mod emit;
 mod flightplan;
 mod mcp;
@@ -50,6 +51,7 @@ fn main() -> Result<()> {
         Commands::Watch { server, all } => {
             cmd_watch(&cfg, &store, server.as_deref(), *all, cli.plain)
         }
+        Commands::Discover { import } => cmd_discover(*import),
     }
 }
 
@@ -264,6 +266,130 @@ fn cmd_watch(
         );
     }
     Ok(())
+}
+
+fn cmd_discover(import: bool) -> Result<()> {
+    let found = discover::discover();
+    if found.is_empty() {
+        println!(
+            "no MCP servers found. gurgl looked in the standard client configs\n\
+             (Claude Desktop, Claude Code's ~/.claude.json, Cursor, Windsurf, Cline).\n\
+             If yours live elsewhere, add servers by hand to {}.",
+            config::default_config_path().display()
+        );
+        return Ok(());
+    }
+
+    println!(
+        "found {} MCP server(s) configured on this machine:\n",
+        found.len()
+    );
+    println!("{:<22} {:<7} {:<34} SOURCE", "NAME", "KIND", "COMMAND");
+    for d in &found {
+        let kind = if d.is_stdio() { "stdio" } else { "remote" };
+        let detail = if d.is_stdio() {
+            let mut c = d.command.clone().unwrap_or_default();
+            if !d.args.is_empty() {
+                c.push(' ');
+                c.push_str(&d.args.join(" "));
+            }
+            c
+        } else {
+            d.url.clone().unwrap_or_default()
+        };
+        let mark = if d.has_env { " [env]" } else { "" };
+        println!(
+            "{:<22} {:<7} {:<34} {}{}",
+            truncate(&d.name, 22),
+            kind,
+            truncate(&detail, 34),
+            d.source,
+            mark
+        );
+    }
+
+    let remote = found.iter().filter(|d| !d.is_stdio()).count();
+    if remote > 0 {
+        println!(
+            "\nnote: {remote} remote (url) server(s) are listed for inventory but gurgl cannot\n\
+             capture them: it watches local stdio subprocesses, not remote HTTP/SSE endpoints."
+        );
+    }
+    if found.iter().any(|d| d.has_env) {
+        println!(
+            "note: [env] servers set environment variables (often API keys) in their client\n\
+             config. gurgl does not copy those, so such a server may need them present in\n\
+             gurgl's own environment to launch."
+        );
+    }
+
+    let stdio: Vec<&discover::Discovered> = found.iter().filter(|d| d.is_stdio()).collect();
+    if !import {
+        println!(
+            "\nto watch these, add the stdio ones to {} (or re-run with --import),\n\
+             then `gurgl watch`.",
+            config::default_config_path().display()
+        );
+        return Ok(());
+    }
+    if stdio.is_empty() {
+        println!("\nnothing to import: no local stdio servers found.");
+        return Ok(());
+    }
+    import_servers(&stdio)
+}
+
+/// Append discovered stdio servers to gurgl.toml, skipping any already present.
+fn import_servers(stdio: &[&discover::Discovered]) -> Result<()> {
+    let path = config::default_config_path();
+    if !path.exists() {
+        let home = config::gurgl_home();
+        std::fs::create_dir_all(&home)
+            .with_context(|| format!("creating gurgl home {}", home.display()))?;
+        std::fs::write(&path, Config::template())
+            .with_context(|| format!("writing {}", path.display()))?;
+        println!("\ncreated {}", path.display());
+    }
+
+    let mut names: std::collections::HashSet<String> = Config::load(&path)
+        .map(|c| c.servers.into_iter().map(|s| s.name).collect())
+        .unwrap_or_default();
+
+    let mut text =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let mut added = 0;
+    for d in stdio {
+        if !names.insert(d.name.clone()) {
+            continue; // already configured, or a duplicate across client configs
+        }
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&discover::to_toml_block(d));
+        added += 1;
+    }
+
+    if added == 0 {
+        println!(
+            "\nall discovered stdio servers are already in {}.",
+            path.display()
+        );
+        return Ok(());
+    }
+    std::fs::write(&path, &text).with_context(|| format!("writing {}", path.display()))?;
+    println!("\nimported {added} server(s) into {}.", path.display());
+    println!("run `gurgl watch` to capture them all, or `gurgl watch <name>` for one.");
+    Ok(())
+}
+
+/// Truncate to `max` display chars with a trailing ellipsis, char-boundary safe.
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let keep = max.saturating_sub(3);
+    let head: String = s.chars().take(keep).collect();
+    format!("{head}...")
 }
 
 fn resolve_version(store: &Store, server: &str, version: Option<&str>) -> Result<String> {

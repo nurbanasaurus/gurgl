@@ -72,4 +72,11 @@ pub enum Commands {
         #[arg(long)]
         all: bool,
     },
+
+    /// Find MCP servers configured on this machine (Claude, Cursor, Windsurf, ...).
+    Discover {
+        /// Append the discovered stdio servers to gurgl.toml so `watch` can run them.
+        #[arg(long)]
+        import: bool,
+    },
 }

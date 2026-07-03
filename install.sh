@@ -86,6 +86,13 @@ fi
 # something to run immediately (idempotent: leaves an existing config alone).
 GURGL_HOME="$GURGL_HOME" "$GURGL_HOME/bin/gurgl" init >/dev/null 2>&1 || true
 
+# 3d. surface the MCP servers already configured on this machine (Claude, Cursor,
+# Windsurf, Cline, ...) so you see right away what gurgl can watch. Listing only;
+# it does not modify anything (re-run `gurgl discover --import` to add them).
+echo
+echo ">> scanning for MCP servers already configured on this machine ..."
+GURGL_HOME="$GURGL_HOME" "$GURGL_HOME/bin/gurgl" discover 2>/dev/null || true
+
 # --- 4. runtime dependencies for `gurgl watch` -------------------------------
 install_sandbox() {
   case "$os" in
@@ -168,6 +175,7 @@ else
   # A script can't change the CURRENT shell's PATH; the user must source it.
   echo "   For THIS terminal, run:   . \"$GURGL_HOME/env\""
 fi
-echo "   then:"
-echo "     gurgl init          # writes ~/.gurgl/gurgl.toml + default flight plan"
-echo "     gurgl --config \"$here/examples/gurgl.toml\" diff example-mcp   # try it now"
+echo "   then try:"
+echo "     gurgl discover      # find MCP servers already configured on this machine"
+echo "     gurgl watch         # capture egress for the servers in ~/.gurgl/gurgl.toml"
+echo "     gurgl --config \"$here/examples/gurgl.toml\" diff example-mcp   # offline demo"

@@ -64,6 +64,44 @@ store ready at /home/you/.gurgl/snapshots
 next: edit /home/you/.gurgl/gurgl.toml to list the MCP servers you run, then `gurgl watch --all`.
 ```
 
+### `gurgl discover`
+
+`gurgl discover [--import]` - find the MCP servers already configured on this
+machine instead of hand-listing them. It reads (never writes) the standard client
+configs:
+
+| Client | Config scanned |
+|--------|----------------|
+| Claude Code | `~/.claude.json` (user scope + per-project `mcpServers`) |
+| Claude Desktop | macOS `~/Library/Application Support/Claude/…`, Linux `~/.config/Claude/…` |
+| Cursor | `~/.cursor/mcp.json` |
+| Windsurf | `~/.codeium/windsurf/mcp_config.json` |
+| Cline (VS Code) | the `saoudrizwan.claude-dev` global storage settings |
+| project-local | `./.mcp.json`, `./.cursor/mcp.json` in the current directory |
+
+```console
+$ gurgl discover
+found 3 MCP server(s) configured on this machine:
+
+NAME                   KIND    COMMAND                            SOURCE
+filesystem             stdio   npx -y @modelcontextprotocol/se... Claude Code (~/.claude.json)
+github                 stdio   npx -y @modelcontextprotocol/se... Cursor (~/.cursor/mcp.json) [env]
+linear-remote          remote  https://mcp.linear.app/sse         Cursor (~/.cursor/mcp.json)
+```
+
+`--import` appends the local `stdio` servers to `gurgl.toml` (creating it if
+needed), skipping any already listed, so re-running is safe. Two limits it prints
+inline rather than hiding:
+
+- **`remote` (url) servers** are shown for inventory but not imported: gurgl
+  captures local stdio subprocesses, not remote HTTP/SSE endpoints.
+- **`[env]` servers** set environment variables (commonly API keys) in their
+  client config. gurgl neither reads nor copies those values; such a server may
+  need them present in gurgl's own environment to launch.
+
+`gurgl discover` also runs automatically at the end of `install.sh` (listing
+only), so a fresh install shows you what is watchable right away.
+
 ### `gurgl list`
 
 Lists captured servers and their versions in the store.

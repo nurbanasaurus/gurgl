@@ -75,6 +75,8 @@ Path helpers live in `config.rs` (`gurgl_home()`, `default_config_path()`,
 - `sandbox.rs` / `proxy.rs` - `build_argv()` (pure, tested) + spawn helpers.
 - `flightplan.rs` - parse/fingerprint the scripted battery.
 - `mcp.rs` - minimal MCP JSON-RPC message builders.
+- `report.rs` - `Reporter` trait + `PlainReporter` (piped/`--plain`) and
+  `DashboardReporter` (live ANSI dashboard, no deps, TTY-gated). `watch` only.
 
 ## Conventions
 

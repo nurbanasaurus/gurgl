@@ -23,6 +23,11 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub store: Option<PathBuf>,
 
+    /// Plain output for `watch` (no live dashboard). Auto-on when stderr isn't a
+    /// terminal, so pipes and scripts already get plain output.
+    #[arg(long, global = true)]
+    pub plain: bool,
+
     #[command(subcommand)]
     pub command: Commands,
 }

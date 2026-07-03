@@ -13,9 +13,11 @@ mod mcp;
 mod model;
 mod observe;
 mod proxy;
+mod report;
 mod sandbox;
 mod store;
 
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -45,7 +47,9 @@ fn main() -> Result<()> {
             version,
             format,
         } => cmd_allow(&store, server, version.as_deref(), format),
-        Commands::Watch { server, all } => cmd_watch(&cfg, &store, server.as_deref(), *all),
+        Commands::Watch { server, all } => {
+            cmd_watch(&cfg, &store, server.as_deref(), *all, cli.plain)
+        }
     }
 }
 
@@ -212,7 +216,13 @@ fn cmd_allow(store: &Store, server: &str, version: Option<&str>, format: &str) -
     Ok(())
 }
 
-fn cmd_watch(cfg: &Config, store: &Store, server: Option<&str>, all: bool) -> Result<()> {
+fn cmd_watch(
+    cfg: &Config,
+    store: &Store,
+    server: Option<&str>,
+    all: bool,
+    plain: bool,
+) -> Result<()> {
     let targets: Vec<&config::ServerSpec> = if all {
         cfg.servers.iter().collect()
     } else if let Some(name) = server {
@@ -232,9 +242,16 @@ fn cmd_watch(cfg: &Config, store: &Store, server: Option<&str>, all: bool) -> Re
     let plan = FlightPlan::load(&plan_path)
         .with_context(|| format!("loading flight plan {}", plan_path.display()))?;
 
+    // Live dashboard when attached to a terminal; plain lines when piped or with
+    // --plain, so logs and scripts are unaffected.
+    let mode = if plain || !std::io::stderr().is_terminal() {
+        report::Mode::Plain
+    } else {
+        report::Mode::Dashboard
+    };
+
     for spec in targets {
-        eprintln!("capturing {} ({} trials)...", spec.name, cfg.trials);
-        let snap = observe::capture(cfg, spec, &plan)?;
+        let snap = observe::capture(cfg, spec, &plan, mode)?;
         let path = store.save(&snap)?;
         println!(
             "saved {}@{} -> {}",

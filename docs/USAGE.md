@@ -37,6 +37,7 @@ gurgl reports what it **observed**. It never certifies a tool as safe - see
 |------|---------|
 | `-c, --config <path>` | Use this config file. |
 | `--store <dir>` | Override where snapshots are read/written. |
+| `--plain` | Disable the live `watch` dashboard (auto-off when not a terminal). |
 | `--version`, `--help` | Standard. |
 
 **Config discovery** (when `--config` is omitted), in order:
@@ -111,6 +112,12 @@ saved filesystem-mcp@1.3.0 -> /home/you/.gurgl/snapshots/filesystem-mcp/1.3.0.js
 
 Each capture writes `<store>/<server>/<version>.json`. Re-running the same
 version overwrites it.
+
+The output above is the **plain** form, used when stderr is not a terminal (piped
+to a file, in CI) or with `--plain`. In a terminal, `watch` instead shows a live
+dashboard: a trial progress bar, per-phase timers, and hosts streaming in colored
+by class. It draws on the alternate screen and restores your terminal on exit, so
+scrollback is untouched; the final snapshot summary is left in place afterward.
 
 ### `gurgl diff`
 

@@ -18,8 +18,9 @@ use serde_json::Value;
 
 use crate::config::{Config, ServerSpec};
 use crate::flightplan::FlightPlan;
-use crate::model::{classify, Host, Reproducibility, Snapshot};
+use crate::model::{classify, Host, HostClass, Reproducibility, Snapshot};
 use crate::proxy::{FlowHost, RawFlow};
+use crate::report::{self, Reporter};
 use crate::{mcp, proxy, sandbox};
 
 /// Aggregate per-trial host observations into final hosts, applying the
@@ -81,15 +82,26 @@ pub fn preflight(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-/// Full capture of one server@version.
-pub fn capture(cfg: &Config, spec: &ServerSpec, plan: &FlightPlan) -> Result<Snapshot> {
+/// Full capture of one server@version. `mode` selects the progress UI (a live
+/// dashboard, or plain lines for pipes/scripts).
+pub fn capture(
+    cfg: &Config,
+    spec: &ServerSpec,
+    plan: &FlightPlan,
+    mode: report::Mode,
+) -> Result<Snapshot> {
+    // Preflight before taking over the terminal, so a missing-backend error
+    // prints normally rather than inside the dashboard's alternate screen.
     preflight(cfg)?;
+    let mut reporter = report::reporter_for(mode, &spec.name, cfg.trials);
 
     let mut trials: Vec<Vec<FlowHost>> = Vec::with_capacity(cfg.trials as usize);
     for i in 1..=cfg.trials {
-        eprintln!("  trial {i}/{}", cfg.trials);
-        let hosts =
-            run_trial(cfg, spec, plan, i).with_context(|| format!("trial {i} of {}", spec.name))?;
+        reporter.trial_start(i, cfg.trials);
+        let hosts = run_trial(cfg, spec, plan, i, reporter.as_mut())
+            .with_context(|| format!("trial {i} of {}", spec.name))?;
+        let uniq: std::collections::BTreeSet<&String> = hosts.iter().map(|h| &h.host).collect();
+        reporter.trial_end(i, uniq.len());
         trials.push(hosts);
     }
 
@@ -99,7 +111,7 @@ pub fn capture(cfg: &Config, spec: &ServerSpec, plan: &FlightPlan) -> Result<Sna
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    Ok(Snapshot {
+    let snapshot = Snapshot {
         server: spec.name.clone(),
         version: spec
             .version
@@ -110,7 +122,9 @@ pub fn capture(cfg: &Config, spec: &ServerSpec, plan: &FlightPlan) -> Result<Sna
         flightplan: plan.fingerprint(),
         gurgl_version: env!("CARGO_PKG_VERSION").to_string(),
         hosts,
-    })
+    };
+    reporter.finish(&snapshot);
+    Ok(snapshot)
 }
 
 /// Kill (and reap) a child when this guard drops, so an early return mid-trial
@@ -130,6 +144,7 @@ fn run_trial(
     spec: &ServerSpec,
     plan: &FlightPlan,
     trial: u32,
+    reporter: &mut dyn Reporter,
 ) -> Result<Vec<FlowHost>> {
     // Per-trial scratch (its own flow file + addon copy).
     let tmp = std::env::temp_dir().join(format!(
@@ -209,9 +224,13 @@ fn run_trial(
     let mut phase_marks: Vec<(f64, String)> = Vec::new();
     let mut id: u64 = 0;
     let mut chosen_tool: Option<String> = None;
+    // Hosts already surfaced to the reporter this trial (so the live view shows
+    // each once as it first appears).
+    let mut surfaced: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
     for step in &plan.steps {
         phase_marks.push((now_epoch(), step.phase.clone()));
+        reporter.phase(&step.phase);
         match step.action.as_str() {
             "initialize" => {
                 id += 1;
@@ -235,12 +254,32 @@ fn run_trial(
                     );
                     let _ = read_response(&rx, id, Duration::from_secs(25));
                 } else {
-                    eprintln!("    (no benign tool to call; skipping tools/call step)");
+                    reporter.note("no benign tool to call; skipping tools/call step");
                 }
             }
-            "sleep" => thread::sleep(Duration::from_secs(step.seconds.unwrap_or(5))),
-            other => eprintln!("    (unknown flight-plan action '{other}', skipping)"),
+            // Poll during the idle sleep too, so late beacons stream in live.
+            "sleep" => {
+                let end = Instant::now() + Duration::from_secs(step.seconds.unwrap_or(5));
+                while Instant::now() < end {
+                    thread::sleep(Duration::from_millis(200));
+                    surface_hosts(
+                        &flows_path,
+                        &step.phase,
+                        &spec.first_party,
+                        &mut surfaced,
+                        reporter,
+                    );
+                }
+            }
+            other => reporter.note(&format!("unknown flight-plan action '{other}', skipping")),
         }
+        surface_hosts(
+            &flows_path,
+            &step.phase,
+            &spec.first_party,
+            &mut surfaced,
+            reporter,
+        );
     }
 
     // --- tear down: close stdin, let requests flush, then kill (guards) ---
@@ -253,10 +292,28 @@ fn run_trial(
     // --- read flows, attribute each host to a phase by timestamp ---
     let raw = proxy::parse_flows(&flows_path)?;
     let hosts = attribute_phases(raw, &phase_marks);
-    let uniq: std::collections::BTreeSet<&String> = hosts.iter().map(|h| &h.host).collect();
-    eprintln!("    observed {} host(s)", uniq.len());
     let _ = std::fs::remove_dir_all(&tmp);
     Ok(hosts)
+}
+
+/// Read the flow file mid-capture and hand any not-yet-seen hosts to the
+/// reporter (so the dashboard streams hosts as they appear). Tolerant of a
+/// partially written file: a failed parse just means we catch them next tick.
+fn surface_hosts(
+    flows_path: &Path,
+    phase: &str,
+    first_party: &[String],
+    surfaced: &mut std::collections::BTreeSet<String>,
+    reporter: &mut dyn Reporter,
+) {
+    if let Ok(raw) = proxy::parse_flows(flows_path) {
+        for f in raw {
+            if surfaced.insert(f.host.clone()) {
+                let class: HostClass = classify(&f.host, first_party);
+                reporter.host(&f.host, class, phase);
+            }
+        }
+    }
 }
 
 /// De-duplicate raw flows to unique (host, phase) pairs.

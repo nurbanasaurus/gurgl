@@ -160,6 +160,15 @@ example.com                              first-party  stable       2/2
 example.org                              unknown      stable       2/2
 ```
 
+### Live dashboard
+
+Run in a terminal, `gurgl watch` shows a live, colored dashboard: a trial
+progress bar, a per-phase timer and timeline, and hosts streaming in colored by
+class as they are contacted. Piped or non-interactive output stays plain, so logs
+and scripts are unaffected; force plain anywhere with `--plain`. It adds no
+dependencies (plain ANSI on the alternate screen) and restores your terminal when
+it finishes.
+
 ## Where things live: `~/.gurgl`
 
 ```
@@ -204,8 +213,8 @@ make deploy HOST=my-mac      # rsync latest source, rebuild + reinstall natively
 | `gurgl allow <server> [--format ...]` | Emit an allowlist (`sandbox-runtime` / `opensnitch` / `squid`). |
 
 Global flags: `--config <path>` (else `./gurgl.toml`, else `~/.gurgl/gurgl.toml`),
-`--store <dir>`. Every flag, the config schema, and flight plans are documented
-in **[docs/USAGE.md](docs/USAGE.md)**.
+`--store <dir>`, `--plain` (disable the live dashboard). Every flag, the config
+schema, and flight plans are documented in **[docs/USAGE.md](docs/USAGE.md)**.
 
 ## What gurgl cannot do (read this)
 

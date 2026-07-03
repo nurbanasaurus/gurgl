@@ -31,7 +31,9 @@ impl std::fmt::Display for HostClass {
             HostClass::Registry => "registry",
             HostClass::Unknown => "unknown",
         };
-        f.write_str(s)
+        // Use pad() (not write_str) so format width/alignment like `{:<11}`
+        // applies when the class is formatted directly.
+        f.pad(s)
     }
 }
 

@@ -77,7 +77,12 @@ configs:
 | Cursor | `~/.cursor/mcp.json` |
 | Windsurf | `~/.codeium/windsurf/mcp_config.json` |
 | Cline (VS Code) | the `saoudrizwan.claude-dev` global storage settings |
+| Codex CLI | `~/.codex/config.toml` and any project `.codex/config.toml` (TOML `[mcp_servers.*]`) |
 | project / plugin | every `.mcp.json` under `$HOME` (Claude Code per-project configs, plugin-shipped servers) and `./.cursor/mcp.json` |
+
+Not scanned: **ChatGPT**. Its MCP connectors are remote HTTPS endpoints
+configured in your OpenAI account, so there is no local config file to read and no
+local process to capture (the same limit as any `remote (url)` server).
 
 ```console
 $ gurgl discover

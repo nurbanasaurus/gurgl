@@ -167,8 +167,9 @@ example.org                              unknown      stable       2/2
 
 You do not have to hand-list servers. `gurgl discover` scans the standard MCP
 client configs on this machine - Claude Desktop, Claude Code (`~/.claude.json`),
-Cursor, Windsurf, Cline - and every project-scoped `.mcp.json` under your home,
-then shows what it finds:
+Cursor, Windsurf, Cline, and Codex (`~/.codex/config.toml`) - plus every
+project-scoped `.mcp.json` and `.codex/config.toml` under your home, then shows
+what it finds:
 
 ```
 found 3 MCP server(s) configured on this machine:
@@ -193,6 +194,12 @@ can capture them. It is safe to re-run (it skips servers already listed). Two
 honest limits it calls out inline: `remote` (url) servers are inventory only -
 gurgl watches local subprocesses, not remote HTTP/SSE endpoints - and `[env]`
 servers set their own environment (often API keys), which gurgl does not copy.
+
+**Not covered: ChatGPT.** ChatGPT's MCP support (Developer Mode) is remote-only:
+its connectors are HTTPS endpoints configured in your OpenAI account, not a local
+config on your machine, and not a local process. There is nothing on disk to
+discover and nothing local to sandbox, so ChatGPT is outside gurgl's model for
+the same reason `remote (url)` servers are listed but never captured.
 
 ### Live dashboard
 

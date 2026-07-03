@@ -8,9 +8,16 @@
 //! 1. the well-known client config files (Claude Desktop, Claude Code's
 //!    `~/.claude.json`, Cursor, Windsurf, Cline); and
 //! 2. every project-scoped `.mcp.json` under `$HOME` (Claude Code's per-project
-//!    config, and where plugins ship theirs). Matching that exact filename keeps
-//!    this precise - unrelated JSON that merely mentions `mcpServers` (schemas,
-//!    API discovery docs) is not named `.mcp.json`, so it is not picked up.
+//!    config, and where plugins ship theirs) plus every Codex `.codex/config.toml`
+//!    (a different, TOML `[mcp_servers.<name>]` shape). Matching those exact names
+//!    keeps this precise - unrelated JSON that merely mentions `mcpServers`
+//!    (schemas, API discovery docs) is not named `.mcp.json`, so it is not picked
+//!    up.
+//!
+//! Out of scope by design: ChatGPT. Its MCP is remote-only (HTTPS connectors
+//! configured in your OpenAI account), so there is no local config to read and no
+//! local process to watch - the same reason gurgl lists but never captures
+//! `remote (url)` servers.
 //!
 //! This only reads config files; it never records or prints `env` values (which
 //! commonly hold API keys). It reports *that* a server sets env, not what.
@@ -135,12 +142,16 @@ pub fn discover() -> Vec<Discovered> {
         parse_file(&path, label, &mut out);
     }
 
-    // 2) project-scoped `.mcp.json` files anywhere under $HOME (and the current
-    // dir). This is where Claude Code keeps per-project MCP servers, and where
-    // plugins ship theirs; the fixed list above never sees them.
-    for path in project_mcp_files() {
-        let label = label_for(&path);
-        parse_file(&path, label, &mut out);
+    // 2) config files found anywhere under $HOME (and the current dir): Claude
+    // Code project/plugin `.mcp.json`, and Codex `.codex/config.toml`. The fixed
+    // list above never sees these.
+    for path in home_config_files() {
+        if path.file_name().and_then(|f| f.to_str()) == Some("config.toml") {
+            parse_codex_file(&path, &mut out);
+        } else {
+            let label = label_for(&path);
+            parse_file(&path, label, &mut out);
+        }
     }
 
     // A server can surface from more than one file (e.g. a plugin present in both
@@ -174,12 +185,60 @@ fn parse_file(path: &Path, label: &str, out: &mut Vec<Discovered>) {
     collect(&json, label, path, out);
 }
 
-/// Recursively find files named exactly `.mcp.json` under `$HOME` and the
-/// current directory, pruning heavy or irrelevant directories and bounding depth
-/// so this stays fast on a large home. macOS `~/Library` is pruned (the Claude
-/// Desktop config there is already a fixed location above and is not a
-/// `.mcp.json`).
-fn project_mcp_files() -> Vec<PathBuf> {
+/// Read a Codex `config.toml` and append its `[mcp_servers.<name>]` entries.
+/// Codex uses TOML, not the JSON `mcpServers` shape, and either `command`+`args`
+/// (stdio) or `url` (Streamable HTTP). A server with `enabled = false` is still
+/// listed for inventory (it is left as `Configured`, i.e. present, not on).
+fn parse_codex_file(path: &Path, out: &mut Vec<Discovered>) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(val) = toml::from_str::<toml::Value>(&text) else {
+        return;
+    };
+    let Some(servers) = val.get("mcp_servers").and_then(|v| v.as_table()) else {
+        return;
+    };
+    let src = source("Codex", path);
+    for (name, spec) in servers {
+        let command = spec
+            .get("command")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let url = spec.get("url").and_then(|v| v.as_str()).map(String::from);
+        let args = spec
+            .get("args")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let has_env = spec
+            .get("env")
+            .and_then(|v| v.as_table())
+            .map(|t| !t.is_empty())
+            .unwrap_or(false);
+        out.push(Discovered {
+            name: name.clone(),
+            command,
+            args,
+            url,
+            has_env,
+            source: src.clone(),
+            status: Status::Configured,
+        });
+    }
+}
+
+/// Recursively find MCP config files under `$HOME` and the current directory:
+/// every `.mcp.json` (Claude Code project/plugin configs) and every
+/// `.codex/config.toml` (Codex CLI global + per-project config). Heavy or
+/// irrelevant directories are pruned and depth is bounded so this stays fast on a
+/// large home. macOS `~/Library` is pruned (the Claude Desktop config there is
+/// already a fixed location above and is not one of these names).
+fn home_config_files() -> Vec<PathBuf> {
     const PRUNE: &[&str] = &[
         "node_modules",
         ".git",
@@ -236,8 +295,16 @@ fn project_mcp_files() -> Vec<PathBuf> {
                     continue;
                 }
                 stack.push((entry.path(), depth + 1));
-            } else if entry.file_name().to_str() == Some(".mcp.json") {
-                found.push(entry.path());
+            } else {
+                let fname = entry.file_name();
+                let is_mcp_json = fname.to_str() == Some(".mcp.json");
+                // Codex uses `config.toml`, but only a Codex one when it sits
+                // inside a `.codex` dir (config.toml is otherwise a common name).
+                let is_codex = fname.to_str() == Some("config.toml")
+                    && dir.file_name().and_then(|d| d.to_str()) == Some(".codex");
+                if is_mcp_json || is_codex {
+                    found.push(entry.path());
+                }
             }
         }
     }
@@ -543,6 +610,42 @@ mod tests {
         // A configured-but-unapproved project server -> Configured.
         let pending = disc("monarch", "project (~/some/repo/.mcp.json)");
         assert_eq!(idx.status_for(&pending), Status::Configured);
+    }
+
+    #[test]
+    fn parse_codex_reads_toml_mcp_servers() {
+        let toml_text = r#"
+model = "gpt-5"
+
+[mcp_servers.docs]
+command = "npx"
+args = ["-y", "docs-mcp"]
+env = { API_KEY = "x" }
+
+[mcp_servers.remote_tool]
+url = "https://mcp.example.com/mcp"
+bearer_token_env_var = "TOKEN"
+"#;
+        let dir = std::env::temp_dir().join("gurgl-codex-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, toml_text).unwrap();
+
+        let mut out = Vec::new();
+        parse_codex_file(&path, &mut out);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(out.len(), 2);
+        let docs = out.iter().find(|d| d.name == "docs").unwrap();
+        assert!(docs.is_stdio());
+        assert_eq!(docs.command.as_deref(), Some("npx"));
+        assert_eq!(docs.args, vec!["-y", "docs-mcp"]);
+        assert!(docs.has_env);
+        assert!(docs.source.starts_with("Codex "));
+
+        let remote = out.iter().find(|d| d.name == "remote_tool").unwrap();
+        assert!(!remote.is_stdio());
+        assert_eq!(remote.url.as_deref(), Some("https://mcp.example.com/mcp"));
     }
 
     #[test]

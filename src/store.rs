@@ -23,6 +23,16 @@ impl Store {
         &self.root
     }
 
+    /// Whether a snapshot is already stored for this server@version. `save`
+    /// overwrites silently by design (re-capturing the same version refreshes
+    /// it); callers use this to warn when that would destroy a baseline.
+    pub fn exists(&self, server: &str, version: &str) -> bool {
+        self.root
+            .join(server)
+            .join(format!("{version}.json"))
+            .is_file()
+    }
+
     pub fn save(&self, snap: &Snapshot) -> Result<PathBuf> {
         let dir = self.root.join(&snap.server);
         std::fs::create_dir_all(&dir)

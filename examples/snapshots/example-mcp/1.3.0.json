@@ -11,35 +11,46 @@
       "class": "registry",
       "reproducibility": "stable",
       "seen_in_trials": 5,
-      "phases": ["startup"]
+      "phases": [
+        "startup"
+      ]
     },
     {
       "name": "api.example-vendor.com",
       "class": "first-party",
       "reproducibility": "stable",
       "seen_in_trials": 5,
-      "phases": ["startup", "tool-call"]
+      "phases": [
+        "startup",
+        "tool-call"
+      ]
     },
     {
-      "name": "telemetry.example-analytics.io",
+      "name": "o1234.ingest.sentry.io",
       "class": "telemetry",
       "reproducibility": "stable",
       "seen_in_trials": 5,
-      "phases": ["startup"]
+      "phases": [
+        "startup"
+      ]
     },
     {
       "name": "beacon.unknown-cdn.example",
       "class": "unknown",
       "reproducibility": "stable",
       "seen_in_trials": 5,
-      "phases": ["tool-call"]
+      "phases": [
+        "tool-call"
+      ]
     },
     {
       "name": "edge-42.rollout-cohort.example",
       "class": "unknown",
       "reproducibility": "intermittent",
       "seen_in_trials": 2,
-      "phases": ["idle"]
+      "phases": [
+        "idle"
+      ]
     }
   ]
 }

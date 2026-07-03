@@ -134,6 +134,11 @@ fn build_bwrap_argv(spec: &ServerSpec, env: &ProxyEnv) -> Vec<String> {
         "/tmp".into(),
         "--dir".into(),
         "/tmp/home".into(),
+        // The starter config's filesystem server needs its allowed directory to
+        // exist; the tmpfs above masks any host-side /tmp/gurgl-scratch, so
+        // create it inside the sandbox (the stock server exits if it's absent).
+        "--dir".into(),
+        crate::config::SCRATCH_DIR.into(),
         "--proc".into(),
         "/proc".into(),
         "--dev".into(),

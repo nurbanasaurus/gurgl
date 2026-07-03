@@ -15,12 +15,25 @@ use serde::{Deserialize, Serialize};
 pub enum HostClass {
     /// The server's declared first-party API/backend (from its config entry).
     FirstParty,
-    /// A known telemetry/analytics endpoint.
+    /// A known telemetry/analytics endpoint (matched a specific vendor domain).
     Telemetry,
+    /// Merely NAMES itself telemetry/analytics (a leading `telemetry.` /
+    /// `analytics.` label) but matched no known vendor. Anyone can pick a
+    /// hostname, so this must never look as vetted as a vendor match -
+    /// scrutinize it like `Unknown`.
+    TelemetryNamed,
     /// A package registry / update host (npm, PyPI, crates.io, GitHub, ...).
     Registry,
     /// Not matched by any rule. Worth a human look.
     Unknown,
+}
+
+impl HostClass {
+    /// Classes that deserve human scrutiny when stable: unrecognized hosts, and
+    /// hosts whose only "classification" is what they call themselves.
+    pub fn needs_scrutiny(self) -> bool {
+        matches!(self, HostClass::Unknown | HostClass::TelemetryNamed)
+    }
 }
 
 impl std::fmt::Display for HostClass {
@@ -28,6 +41,7 @@ impl std::fmt::Display for HostClass {
         let s = match self {
             HostClass::FirstParty => "first-party",
             HostClass::Telemetry => "telemetry",
+            HostClass::TelemetryNamed => "telemetry?",
             HostClass::Registry => "registry",
             HostClass::Unknown => "unknown",
         };
@@ -94,8 +108,12 @@ impl Snapshot {
     }
 }
 
-/// Classify a host name. Explicit first-party matches win, then telemetry, then
-/// registry; anything unrecognised is `Unknown` (deliberately, so it surfaces).
+/// Classify a host name. Explicit first-party matches win, then known telemetry
+/// vendors, then registries; a host that merely NAMES itself telemetry (a
+/// `telemetry.`/`analytics.` label, no vendor match) is `TelemetryNamed`, not
+/// `Telemetry` - a hostname is chosen by whoever registers it, so the calming
+/// class is reserved for domains on the vendor list. Anything unrecognised is
+/// `Unknown` (deliberately, so it surfaces).
 pub fn classify(name: &str, first_party: &[String]) -> HostClass {
     let name = name.trim().to_ascii_lowercase();
 
@@ -107,6 +125,9 @@ pub fn classify(name: &str, first_party: &[String]) -> HostClass {
     }
     if REGISTRY.iter().any(|p| host_matches(&name, p)) {
         return HostClass::Registry;
+    }
+    if TELEMETRY_LABELS.iter().any(|p| host_matches(&name, p)) {
+        return HostClass::TelemetryNamed;
     }
     HostClass::Unknown
 }
@@ -140,9 +161,12 @@ const TELEMETRY: &[&str] = &[
     "mixpanel.com",
     "bugsnag.com",
     "google-analytics.com",
-    "analytics.",
-    "telemetry.",
 ];
+
+/// Coarse self-naming patterns. Matching one of these WITHOUT matching the
+/// vendor list above yields `TelemetryNamed`, never the vetted `Telemetry`
+/// class: `telemetry.attacker.example` must not look reassuring.
+const TELEMETRY_LABELS: &[&str] = &["analytics.", "telemetry."];
 
 const REGISTRY: &[&str] = &[
     "registry.npmjs.org",
@@ -183,6 +207,31 @@ mod tests {
         assert_eq!(
             classify("beacon.weird-host.example", &fp),
             HostClass::Unknown
+        );
+    }
+
+    #[test]
+    fn self_named_telemetry_is_not_vetted() {
+        // A hostname is chosen by whoever registers it: a `telemetry.` label
+        // with no vendor match must NOT get the calming vendor class.
+        assert_eq!(
+            classify("telemetry.attacker.example", &[]),
+            HostClass::TelemetryNamed
+        );
+        assert_eq!(
+            classify("app.analytics.evil.example", &[]),
+            HostClass::TelemetryNamed
+        );
+        assert!(HostClass::TelemetryNamed.needs_scrutiny());
+        assert!(HostClass::Unknown.needs_scrutiny());
+        assert!(!HostClass::Telemetry.needs_scrutiny());
+        // A real vendor still classifies as vetted telemetry.
+        assert_eq!(classify("o1.ingest.sentry.io", &[]), HostClass::Telemetry);
+        // Declared first-party still wins over the label pattern.
+        let fp = vec!["telemetry.myvendor.com".to_string()];
+        assert_eq!(
+            classify("telemetry.myvendor.com", &fp),
+            HostClass::FirstParty
         );
     }
 }

@@ -5,7 +5,7 @@ first ([INSTALL.md](INSTALL.md)), then read this top to bottom once.
 
 - [Mental model](#mental-model)
 - [Global flags & config discovery](#global-flags--config-discovery)
-- [Commands](#commands): [init](#gurgl-init) · [list](#gurgl-list) · [show](#gurgl-show) · [watch](#gurgl-watch) · [diff](#gurgl-diff) · [allow](#gurgl-allow)
+- [Commands](#commands): [bare gurgl / demo](#gurgl-bare-and-gurgl-demo) · [init](#gurgl-init) · [discover](#gurgl-discover) · [list](#gurgl-list) · [show](#gurgl-show) · [watch](#gurgl-watch) · [diff](#gurgl-diff) · [allow](#gurgl-allow) · [update](#gurgl-update)
 - [The config file](#the-config-file-gurgltoml)
 - [Flight plans](#flight-plans)
 - [Host classification](#host-classification)
@@ -49,6 +49,18 @@ gurgl reports what it **observed**. It never certifies a tool as safe - see
 ---
 
 ## Commands
+
+### `gurgl` (bare) and `gurgl demo`
+
+Bare `gurgl` prints a git-status-style orientation: which config is in use, the
+servers configured (and how many more `discover` can see on this machine), each
+server's capture history and staleness, and the one next command that makes
+progress from your current state.
+
+`gurgl demo` walks an annotated example diff on data bundled into the binary -
+no mitmproxy, sandbox, or Node required. It teaches the three readings that
+matter: a known-vendor telemetry host, a stable unknown host (the signal), and
+an intermittent host the reproduction gate deliberately keeps quiet about.
 
 ### `gurgl init`
 
@@ -136,7 +148,7 @@ $ gurgl show filesystem-mcp
 filesystem-mcp@1.3.0  (5 trials, flight plan default-...)
 HOST                                     CLASS        REPRO        SEEN
 api.github.com                           registry     stable       5/5
-telemetry.vendor.com                     telemetry    stable       5/5
+o1234.ingest.sentry.io                   telemetry    stable       5/5
 cdn.unknown-3p.net                       unknown      stable       5/5
 ```
 
@@ -214,7 +226,7 @@ $ gurgl diff filesystem-mcp
 filesystem-mcp: 1.2.0 -> 1.3.0
   unchanged hosts: 2
   new hosts:
-    + telemetry.vendor.com                     [telemetry]
+    + o1234.ingest.sentry.io                   [telemetry]
     + cdn.unknown-3p.net                        [unknown]
 
   ⚠ 1 new stable UNKNOWN host(s) - worth a look:
@@ -235,7 +247,7 @@ snapshot, to stdout. Formats: `sandbox-runtime` (default), `opensnitch`, `squid`
 ```console
 $ gurgl allow filesystem-mcp --format squid
 # gurgl allowlist for filesystem-mcp@1.3.0
-acl gurgl_filesystem_mcp dstdomain api.github.com telemetry.vendor.com cdn.unknown-3p.net
+acl gurgl_filesystem_mcp dstdomain api.github.com o1234.ingest.sentry.io cdn.unknown-3p.net
 http_access allow gurgl_filesystem_mcp
 
 $ gurgl allow filesystem-mcp --format sandbox-runtime > allow.txt
@@ -386,12 +398,13 @@ Every observed host is put in one class, used to make diffs readable:
 | Class | Meaning |
 |-------|---------|
 | **first-party** | Matches a `first_party` domain you declared for the server. |
-| **telemetry** | Known analytics/telemetry endpoints. |
+| **telemetry** | Matches a known analytics/crash-reporting vendor domain. |
+| **telemetry?** | Merely NAMES itself telemetry/analytics (`telemetry.*` / `analytics.*`) but matches no known vendor. Anyone can pick a hostname, so this is **not** vetted - scrutinize it like `unknown`. |
 | **registry** | Package registries / code hosts (npm, PyPI, GitHub, ...). |
 | **unknown** | Everything else - **the class to scrutinize**, especially when new. |
 
-A **new stable `unknown`** host after an update is the loudest thing gurgl can
-tell you.
+A **new stable `unknown`** (or `telemetry?`) host after an update is the loudest
+thing gurgl can tell you, and `diff` flags exactly those.
 
 ---
 

@@ -10,6 +10,7 @@ use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -152,19 +153,64 @@ pub fn aggregate(trials: &[Vec<FlowHost>], first_party: &[String]) -> Vec<Host> 
         .collect()
 }
 
-/// Verify the backends this capture needs are available before we start.
+/// Verify the backends this capture needs are available before we start. Every
+/// failure prints the exact fix for THIS machine, not just what is missing.
 pub fn preflight(cfg: &Config) -> Result<()> {
     let sandbox_bin = sandbox::required_binary(cfg.sandbox);
     if !on_path(sandbox_bin) {
-        bail!("sandbox backend '{sandbox_bin}' not found on PATH. Install it, or switch `sandbox` in gurgl.toml.");
+        bail!(
+            "sandbox backend '{sandbox_bin}' not found on PATH.\n  fix: {}\n  (or switch `sandbox` in gurgl.toml; see docs/INSTALL.md)",
+            sandbox_fix(sandbox_bin)
+        );
     }
     if !on_path(&cfg.mitmdump) {
         bail!(
-            "proxy backend '{}' not found on PATH. Install mitmproxy (provides mitmdump).",
-            cfg.mitmdump
+            "proxy backend '{}' not found on PATH. mitmproxy provides it.\n  fix: {}\n  (re-running ./install.sh also sets this up; see docs/INSTALL.md)",
+            cfg.mitmdump,
+            mitmproxy_fix()
         );
     }
     Ok(())
+}
+
+/// The exact install command for the missing sandbox backend on this machine.
+fn sandbox_fix(bin: &str) -> String {
+    match bin {
+        "bwrap" => {
+            for (pm, cmd) in [
+                ("apt-get", "sudo apt-get install -y bubblewrap"),
+                ("dnf", "sudo dnf install -y bubblewrap"),
+                ("pacman", "sudo pacman -S --noconfirm bubblewrap"),
+                ("zypper", "sudo zypper install -y bubblewrap"),
+            ] {
+                if on_path(pm) {
+                    return cmd.to_string();
+                }
+            }
+            "install the 'bubblewrap' package with your distro's package manager".to_string()
+        }
+        "sandbox-exec" => {
+            "sandbox-exec ships with macOS; its absence is unexpected. Check your PATH.".to_string()
+        }
+        "podman" => {
+            "install podman (e.g. sudo apt-get install -y podman / brew install podman)".to_string()
+        }
+        other => format!("install '{other}' with your package manager"),
+    }
+}
+
+/// The best available install route for mitmproxy on this machine, in the same
+/// preference order install.sh uses (brew, pipx, then a dedicated venv).
+fn mitmproxy_fix() -> String {
+    if on_path("brew") {
+        return "brew install mitmproxy".to_string();
+    }
+    if on_path("pipx") {
+        return "pipx install mitmproxy".to_string();
+    }
+    "python3 -m venv ~/.gurgl/mitmproxy-venv && ~/.gurgl/mitmproxy-venv/bin/pip install mitmproxy \
+     && ln -sf ~/.gurgl/mitmproxy-venv/bin/mitmdump ~/.gurgl/bin/mitmdump"
+        .to_string()
 }
 
 /// Full capture of one server@version. `mode` selects the progress UI (a live
@@ -188,6 +234,24 @@ pub fn capture(
              server needs (e.g. Node for npx-based servers), not a gurgl \
              dependency. Install it and retry.",
             spec.command
+        );
+    }
+
+    // Guarantee the starter config's scratch dir exists so `init && watch`
+    // works out of the box. Host-side covers sandbox-exec (macOS, where /tmp is
+    // the host's); bwrap creates it inside its tmpfs (see sandbox.rs).
+    let _ = std::fs::create_dir_all(crate::config::SCRATCH_DIR);
+
+    // Downloading launchers execute third-party code fetched at capture time.
+    // Say so once, plainly - that behavior is surprising from a security tool
+    // if left unstated. Printed before the dashboard takes the terminal.
+    if matches!(spec.command.as_str(), "npx" | "uvx" | "pipx" | "bunx") {
+        eprintln!(
+            "note: '{}' runs `{} {}` inside the sandbox - this downloads and executes \
+             third-party code as part of the capture.",
+            spec.name,
+            spec.command,
+            spec.args.join(" ")
         );
     }
 
@@ -360,9 +424,20 @@ fn run_trial(
         .stdout
         .take()
         .context("server stdout unavailable")?;
+    // Keep the tail of the server's stderr (drained so the pipe never blocks):
+    // when the server dies mid-capture, its last lines are the diagnosis.
+    let stderr_tail: std::sync::Arc<Mutex<std::collections::VecDeque<String>>> =
+        std::sync::Arc::new(Mutex::new(std::collections::VecDeque::new()));
     if let Some(stderr) = server_guard.0.stderr.take() {
+        let tail = stderr_tail.clone();
         thread::spawn(move || {
-            for _ in BufReader::new(stderr).lines() { /* drain so the pipe never blocks */ }
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                let mut t = tail.lock().unwrap_or_else(|e| e.into_inner());
+                if t.len() >= 8 {
+                    t.pop_front();
+                }
+                t.push_back(line);
+            }
         });
     }
     let rx = spawn_line_reader(stdout);
@@ -384,6 +459,17 @@ fn run_trial(
         // the dashboard to actually paint it before the screen is restored.
         if stop_requested() {
             break;
+        }
+        // A battery trial requires a live server for the whole plan. Without
+        // this check, a server that crashes at launch (missing API key, bad
+        // runtime) "completes" every step via timeouts and saves an EMPTY
+        // snapshot that reads as "no egress observed" - a false observation.
+        // Hold mode keeps its own softer exit (a monitor ends when the server
+        // does).
+        if matches!(monitor, Monitor::Battery) {
+            if let Ok(Some(status)) = server_guard.0.try_wait() {
+                bail!("{}", dead_server_msg(&status, &step.phase, &stderr_tail));
+            }
         }
         phase_marks.push((now_epoch(), step.phase.clone()));
         reporter.phase(&step.phase);
@@ -440,6 +526,18 @@ fn run_trial(
             &mut surfaced,
             reporter,
         );
+    }
+
+    // Catch a crash during the plan's FINAL step too (the boundary check above
+    // only runs before each step): a dead server did not complete the method.
+    if matches!(monitor, Monitor::Battery) && !stop_requested() {
+        if let Ok(Some(status)) = server_guard.0.try_wait() {
+            let phase = phase_marks
+                .last()
+                .map(|(_, p)| p.as_str())
+                .unwrap_or("startup");
+            bail!("{}", dead_server_msg(&status, phase, &stderr_tail));
+        }
     }
 
     // The trial is complete only if no stop arrived while the plan ran: a stop
@@ -507,6 +605,33 @@ fn run_trial(
         server_version,
         completed,
     })
+}
+
+/// Compose the error for a server that died mid-plan: what exited, when, its
+/// last stderr lines (the actual diagnosis), and the likeliest fixes. This is
+/// an error, not an observation - saving an empty snapshot here would read as
+/// "no egress observed", which would be false.
+fn dead_server_msg(
+    status: &std::process::ExitStatus,
+    phase: &str,
+    stderr_tail: &Mutex<std::collections::VecDeque<String>>,
+) -> String {
+    let tail: Vec<String> = stderr_tail
+        .lock()
+        .map(|t| t.iter().rev().take(3).rev().cloned().collect())
+        .unwrap_or_default();
+    let diag = if tail.is_empty() {
+        String::from(" It printed nothing on stderr.")
+    } else {
+        format!("\n  its last stderr lines:\n    {}", tail.join("\n    "))
+    };
+    format!(
+        "server exited ({status}) mid-capture (detected at '{phase}') - nothing was \
+         captured (an empty snapshot would falsely read as \"no egress observed\").{diag}\n  \
+         common causes: the server needs env vars (often API keys) from its client config, \
+         which gurgl does not copy - set them in gurgl's environment; or its \
+         runtime/arguments are wrong for this machine."
+    )
 }
 
 /// Make a server-reported version safe to use as a snapshot filename, keeping

@@ -86,6 +86,9 @@ fn class_color(c: HostClass) -> &'static str {
     match c {
         HostClass::FirstParty => GREEN,
         HostClass::Telemetry => YELLOW,
+        // Self-named telemetry is NOT vetted: color it like unknown so it never
+        // reads as reassuring.
+        HostClass::TelemetryNamed => BRED,
         HostClass::Registry => CYAN,
         HostClass::Unknown => BRED,
     }
@@ -756,7 +759,10 @@ fn class_desc(c: HostClass) -> &'static str {
     match c {
         HostClass::FirstParty => "declared first-party for this server (gurgl.toml)",
         HostClass::Registry => "package/artifact registry, expected for npx/uvx-launched servers",
-        HostClass::Telemetry => "known telemetry / feature-gate endpoint",
+        HostClass::Telemetry => "known telemetry / feature-gate vendor",
+        HostClass::TelemetryNamed => {
+            "NAMES itself telemetry/analytics but matches no known vendor. Scrutinize like unknown"
+        }
         HostClass::Unknown => "unclassified. Worth a look if stable across trials",
     }
 }

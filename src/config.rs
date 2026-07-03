@@ -194,6 +194,13 @@ pub fn default_config_path() -> PathBuf {
 /// self-contained `~/.gurgl` without needing the source tree present.
 pub const DEFAULT_FLIGHTPLAN: &str = include_str!("../flightplans/default.toml");
 
+/// Scratch directory the starter config's filesystem server points at. gurgl
+/// guarantees it exists at capture time (host-side for macOS/sandbox-exec, and
+/// created inside the bwrap tmpfs on Linux) so `init && watch` works out of the
+/// box - the stock filesystem server exits at startup if its allowed directory
+/// is missing. Keep TEMPLATE below in sync (a unit test enforces it).
+pub const SCRATCH_DIR: &str = "/tmp/gurgl-scratch";
+
 const TEMPLATE: &str = r#"# gurgl configuration.
 # Local-first egress hygiene for the MCP servers you run.
 
@@ -228,3 +235,21 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp/gurgl-scratch"]
 # command = "npx"
 # args = ["-y", "some-other-mcp"]
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn template_parses_and_uses_the_guaranteed_scratch_dir() {
+        // The starter config must work out of the box: it has to parse, and its
+        // active server must reference the scratch dir gurgl creates at capture
+        // time (SCRATCH_DIR), not some directory nothing guarantees.
+        let cfg: Config = toml::from_str(TEMPLATE).expect("template must parse");
+        assert_eq!(cfg.servers.len(), 1);
+        assert!(
+            cfg.servers[0].args.iter().any(|a| a == SCRATCH_DIR),
+            "template server args must reference SCRATCH_DIR ({SCRATCH_DIR})"
+        );
+    }
+}

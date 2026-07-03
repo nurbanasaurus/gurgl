@@ -73,6 +73,9 @@ Path helpers live in `config.rs` (`gurgl_home()`, `default_config_path()`,
 ## Architecture map
 
 - `model.rs` - `Host`, `Snapshot`, `HostClass`, `Reproducibility`, `classify()`.
+  `HostClass::TelemetryNamed` ("telemetry?") = self-named telemetry with no
+  vendor match; `needs_scrutiny()` groups it with `Unknown` everywhere findings
+  are filtered - a hostname is attacker-chosen, so it must never look vetted.
 - `observe.rs` - `aggregate()` (pure reproduction gate) + `capture()`/`run_trial()`
   live pipeline (spawn proxy, launch sandboxed server, drive MCP over stdio,
   attribute hosts to phases by timestamp). Implemented and verified. `Monitor`
@@ -82,7 +85,11 @@ Path helpers live in `config.rs` (`gurgl_home()`, `default_config_path()`,
   force-quits) plus `request_stop()`/`stop_requested()` checked at step
   boundaries, sleep/monitor ticks, and in 250ms `read_response` slices. A
   battery trial cut short is discarded (the gate compares complete runs);
-  `Snapshot.trials` is the completed count.
+  `Snapshot.trials` is the completed count. A server that EXITS mid-plan in
+  battery mode is an error carrying its stderr tail, never an empty snapshot -
+  "no egress observed" from a dead process would be a false observation.
+  `config::SCRATCH_DIR` is guaranteed at capture time (host-side + bwrap
+  `--dir`) so the starter config works out of the box.
 - `diff.rs` - pure `diff(from, to) -> SnapshotDiff`.
 - `emit.rs` - `allowlist(snapshot, Format)` for sandbox-runtime / opensnitch / squid.
 - `store.rs` - JSON snapshots at `<store>/<server>/<version>.json`.

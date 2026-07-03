@@ -288,6 +288,8 @@ Working from a source clone instead? `make update` (git pull + reinstall) and
 
 | Command | What it does |
 |---------|--------------|
+| `gurgl` (bare) | Orientation: config/server/capture status and the one next command. |
+| `gurgl demo` | Annotated example diff on bundled data - no deps needed. |
 | `gurgl init` | Create `~/.gurgl` (config, default flight plan, store). |
 | `gurgl discover [--import]` | Find MCP servers on this machine (with enabled/bundled status); `--import` adds the stdio ones to `gurgl.toml`. |
 | `gurgl list` | List captured servers and versions. |

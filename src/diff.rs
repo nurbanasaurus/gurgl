@@ -35,11 +35,13 @@ impl SnapshotDiff {
             .collect()
     }
 
-    /// Stable additions that we could not classify - the sharpest signal.
+    /// Stable additions that deserve scrutiny - the sharpest signal. Covers
+    /// `Unknown` and `TelemetryNamed` (a host that merely names itself
+    /// telemetry is not vetted; see model::classify).
     pub fn stable_unknown_added(&self) -> Vec<&HostDelta> {
         self.stable_added()
             .into_iter()
-            .filter(|d| d.class == HostClass::Unknown)
+            .filter(|d| d.class.needs_scrutiny())
             .collect()
     }
 }

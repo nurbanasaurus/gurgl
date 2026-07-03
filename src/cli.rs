@@ -95,4 +95,8 @@ pub enum Commands {
     /// Update gurgl from the public repo and reinstall. Runs only when you ask;
     /// gurgl never checks for or fetches updates on its own.
     Update,
+
+    /// Walk through an annotated example diff using bundled snapshots. Needs no
+    /// mitmproxy, sandbox, or Node - a 30-second tour of what gurgl shows you.
+    Demo,
 }

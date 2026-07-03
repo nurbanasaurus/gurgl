@@ -45,13 +45,9 @@ fn main() -> Result<()> {
     let store = build_store(&cli, &cfg)?;
 
     match &cli.command {
-        None => {
-            // No subcommand: show help rather than erroring.
-            use clap::CommandFactory;
-            Cli::command().print_help().ok();
-            println!();
-            Ok(())
-        }
+        // Bare `gurgl`: a git-status-style orientation beats generic help. It
+        // shows where this machine stands and the one next command that helps.
+        None => cmd_orient(&cfg, &store),
         Some(Commands::Update) => unreachable!("handled above"),
         Some(Commands::Init) => cmd_init(&store),
         Some(Commands::List) => cmd_list(&store),
@@ -79,7 +75,174 @@ fn main() -> Result<()> {
             *until_closed,
         ),
         Some(Commands::Discover { import }) => cmd_discover(*import),
+        Some(Commands::Demo) => cmd_demo(),
     }
+}
+
+/// The bundled example snapshots, embedded so `gurgl demo` works from any
+/// install with zero dependencies (no repo checkout, no capture backend).
+const DEMO_FROM: &str = include_str!("../examples/snapshots/example-mcp/1.2.0.json");
+const DEMO_TO: &str = include_str!("../examples/snapshots/example-mcp/1.3.0.json");
+
+/// Bare `gurgl`: where this machine stands and the single next command that
+/// makes progress. States it never asserts: nothing here is a safety judgment.
+fn cmd_orient(cfg: &Config, store: &Store) -> Result<()> {
+    println!("gurgl - local-first egress hygiene for MCP servers\n");
+
+    // Config: same discovery order load_config used.
+    let local = PathBuf::from("gurgl.toml");
+    let home_cfg = config::default_config_path();
+    let cfg_path = if local.is_file() {
+        Some(local)
+    } else if home_cfg.is_file() {
+        Some(home_cfg)
+    } else {
+        None
+    };
+    match &cfg_path {
+        Some(p) => println!("  config     {}", p.display()),
+        None => println!("  config     none yet"),
+    }
+
+    // Servers configured vs discoverable on this machine.
+    let names: Vec<&str> = cfg.servers.iter().map(|s| s.name.as_str()).collect();
+    if names.is_empty() {
+        println!("  servers    none configured");
+    } else {
+        println!(
+            "  servers    {} configured: {}",
+            names.len(),
+            names.join(", ")
+        );
+    }
+    let unimported = discover::discover()
+        .into_iter()
+        .filter(|d| d.is_stdio() && cfg.server(&d.name).is_none() && !references_client_runtime(d))
+        .count();
+    if unimported > 0 {
+        println!("             {unimported} more MCP server(s) found on this machine (not yet in gurgl.toml)");
+    }
+
+    // Captures: per configured server, history depth and staleness.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut uncaptured: Vec<&str> = Vec::new();
+    let mut diffable: Vec<&str> = Vec::new();
+    for spec in &cfg.servers {
+        let versions = store.versions(&spec.name)?;
+        match versions.last() {
+            None => {
+                println!("  {:<10} no captures yet", spec.name);
+                uncaptured.push(&spec.name);
+            }
+            Some(latest) => {
+                let age = store
+                    .load(&spec.name, latest)
+                    .map(|s| now.saturating_sub(s.captured_at) / 86_400)
+                    .unwrap_or(0);
+                let when = match age {
+                    0 => "today".to_string(),
+                    1 => "1 day ago".to_string(),
+                    n => format!("{n} days ago"),
+                };
+                let extra = if versions.len() >= 2 {
+                    diffable.push(&spec.name);
+                    format!("{} versions (diffable)", versions.len())
+                } else {
+                    "1 version".to_string()
+                };
+                println!("  {:<10} latest @{latest}, {when}, {extra}", spec.name);
+            }
+        }
+    }
+
+    // One suggested next command, by state.
+    let next = if cfg_path.is_none() {
+        "gurgl init                # create ~/.gurgl (config, flight plan, store)".to_string()
+    } else if names.is_empty() && unimported > 0 {
+        "gurgl discover --import   # add the MCP servers found on this machine".to_string()
+    } else if names.is_empty() {
+        format!(
+            "edit {} to add a [[servers]] entry, then `gurgl watch --all`",
+            config::default_config_path().display()
+        )
+    } else if !uncaptured.is_empty() {
+        "gurgl watch --all         # capture a baseline for every server".to_string()
+    } else if let Some(name) = diffable.first() {
+        format!("gurgl diff {name}         # compare the two most recent captures")
+    } else {
+        "after your next update: gurgl watch --all && gurgl diff <server>".to_string()
+    };
+    println!("\n  next:  {next}");
+    println!("\n  new to gurgl? `gurgl demo` is a 30-second tour. `gurgl --help` lists commands.");
+    Ok(())
+}
+
+fn cmd_demo() -> Result<()> {
+    let from: model::Snapshot = serde_json::from_str(DEMO_FROM).context("parsing demo snapshot")?;
+    let to: model::Snapshot = serde_json::from_str(DEMO_TO).context("parsing demo snapshot")?;
+
+    println!(
+        "This is a tour on bundled data - nothing is captured or executed.\n\
+         \n\
+         Suppose you ran `gurgl watch example-mcp` twice: once on v{}, and again\n\
+         after updating to v{}. Each watch runs the server {} times through the\n\
+         same scripted session and records every host it contacts:\n",
+        from.version, to.version, from.trials
+    );
+
+    println!("  example-mcp@{}  (the old baseline)", from.version);
+    for h in &from.hosts {
+        println!("    {:<34} [{}]", h.name, h.class);
+    }
+    println!(
+        "\n  Two hosts, both explainable: the npm registry (it launches via npx)\n\
+         and the vendor's own API. That is the baseline you reviewed.\n"
+    );
+
+    let d = diff::diff(&from, &to);
+    println!("Now the update lands. `gurgl diff example-mcp` compares the two:\n");
+    println!(
+        "  example-mcp: {} -> {}   unchanged hosts: {}",
+        d.from_version, d.to_version, d.unchanged
+    );
+    for delta in &d.added {
+        println!("    + {:<34} [{}]", delta.name, delta.class);
+    }
+
+    println!(
+        "\nHow to read those three new hosts - they are NOT equal:\n\
+         \n\
+         + o1234.ingest.sentry.io [telemetry]\n\
+           Matched a known vendor (Sentry crash reporting). Common in npm\n\
+           packages; now you know this update added it and can decide if you\n\
+           accept it. (A host merely NAMED telemetry.* with no vendor match\n\
+           would show as [telemetry?] and deserve the same scrutiny as unknown.)\n\
+         \n\
+         + beacon.unknown-cdn.example [unknown], seen in 5/5 trials\n\
+           THE signal. Stable (every single run) and matching no known rule:\n\
+           this update reliably contacts somewhere new that nobody can explain\n\
+           yet. This is what gurgl exists to surface - the postmark-mcp pattern.\n\
+         \n\
+         + edge-42.rollout-cohort.example [unknown], seen in 2/5 trials\n\
+           Deliberately NOT flagged. It did not reproduce across trials, which\n\
+           usually means server-side A/B or feature-gate noise, not a change in\n\
+           the tool. Reporting it as a finding would be an accusation the data\n\
+           cannot support - that restraint is the reproduction gate.\n\
+         \n\
+         Note what gurgl does NOT say: it never says \"safe\" or \"malicious\".\n\
+         It shows you what was observed under a fixed session, so the judgment\n\
+         (and the allowlist you enforce) is yours, based on evidence.\n\
+         \n\
+         On your real machine, the same loop is:\n\
+           gurgl discover --import   # find the MCP servers you already have\n\
+           gurgl watch --all         # capture a baseline for each\n\
+           ... update something ...\n\
+           gurgl watch --all && gurgl diff <server>"
+    );
+    Ok(())
 }
 
 fn load_config(cli: &Cli) -> Result<Config> {
@@ -179,7 +342,59 @@ fn cmd_show(store: &Store, server: &str, version: Option<&str>) -> Result<()> {
             snap.trials
         );
     }
+
+    // A snapshot should explain itself: legend for the classes actually present,
+    // what stable/intermittent mean, the coverage caveat, and what to do next.
+    let classes: std::collections::BTreeSet<_> =
+        snap.hosts.iter().map(|h| h.class.to_string()).collect();
+    if !snap.hosts.is_empty() {
+        println!();
+        for c in &classes {
+            println!("  {:<12} {}", c, class_legend(c));
+        }
+        println!(
+            "  {:<12} SEEN n/{}: appeared in n of the {} trials. stable = every trial; \
+             intermittent = some\n  {:<12} trials only (usually server-side cohort noise, \
+             not a change in the tool).",
+            "repro", snap.trials, snap.trials, ""
+        );
+    }
+    println!(
+        "\nnote: presence only - hosts observed under this flight plan. Absence of a host \
+         is non-coverage,\nnot proof the tool won't contact it."
+    );
+    let scrutiny = snap
+        .hosts
+        .iter()
+        .filter(|h| h.class.needs_scrutiny() && h.reproducibility == model::Reproducibility::Stable)
+        .count();
+    if scrutiny > 0 {
+        println!(
+            "\n{scrutiny} stable host(s) matched no known rule - worth a look. Next: search \
+             the package source for\nthe hostname; if it is expected, add it to \
+             `first_party` in gurgl.toml so it classifies as yours."
+        );
+    } else if store.versions(server)?.len() < 2 {
+        println!(
+            "\nnext: after this server updates, run `gurgl watch {server}` again, then \
+             `gurgl diff {server}` -\nnew hosts appearing on an update are the signal."
+        );
+    }
     Ok(())
+}
+
+/// One plain-language line per host class, for the `show` legend.
+fn class_legend(class: &str) -> &'static str {
+    match class {
+        "first-party" => "domains you declared for this server in gurgl.toml",
+        "telemetry" => "a known analytics/crash-reporting vendor",
+        "telemetry?" => {
+            "NAMES itself telemetry but matches no known vendor - scrutinize like unknown"
+        }
+        "registry" => "package registry / code host (expected for npx- or uvx-launched servers)",
+        "unknown" => "matched no rule - the class to scrutinize when stable",
+        _ => "",
+    }
 }
 
 fn cmd_diff(store: &Store, server: &str, from: Option<&str>, to: Option<&str>) -> Result<()> {
@@ -215,12 +430,22 @@ fn cmd_diff(store: &Store, server: &str, from: Option<&str>, to: Option<&str>) -
         let unknown = d.stable_unknown_added();
         if !unknown.is_empty() {
             println!(
-                "\n  ⚠ {} new stable UNKNOWN host(s) - worth a look:",
+                "\n  ⚠ {} new stable host(s) matched no known rule - review before trusting this update:",
                 unknown.len()
             );
-            for u in unknown {
-                println!("    {}", u.name);
+            for u in &unknown {
+                println!("    {}  [{}]", u.name, u.class);
             }
+            // Tell the user what to actually DO, not just that it happened.
+            println!(
+                "\n  next steps:\n    \
+                 1. confirm:  gurgl watch {}   (does it reproduce in a fresh capture?)\n    \
+                 2. inspect:  search the package source for the hostname (e.g. grep it in\n                 \
+                 the npm tarball or repo) to see what contacts it and why\n    \
+                 3. decide:   expected -> add it to `first_party` in gurgl.toml;\n                 \
+                 not expected -> stay on {} and investigate before upgrading",
+                d.server, d.from_version
+            );
         }
     }
 
@@ -309,16 +534,33 @@ fn cmd_watch(
             .with_context(|| format!("loading flight plan {}", plan_path.display()))
             .and_then(|plan| observe::capture(cfg, spec, &plan, mode, monitor))
             .and_then(|snap| {
+                let overwrote = store.exists(&snap.server, &snap.version);
                 let path = store.save(&snap)?;
-                Ok((path, snap))
+                Ok((path, snap, overwrote))
             }) {
-            Ok((path, snap)) => {
+            Ok((path, snap, overwrote)) => {
                 println!(
                     "saved {}@{} -> {}",
                     snap.server,
                     snap.version,
                     path.display()
                 );
+                // Same-version captures overwrite. That is fine for refreshing a
+                // baseline, but silent destruction of history breaks `diff`,
+                // especially for servers stuck on the "unknown" label.
+                if overwrote {
+                    println!(
+                        "note: this replaced the previous capture of {}@{} (same version \
+                         label), so there is nothing new for `gurgl diff` to compare.",
+                        snap.server, snap.version
+                    );
+                    if snap.version == "unknown" {
+                        println!(
+                            "      this server reports no version; pin one in gurgl.toml \
+                             (version = \"...\") so each capture keeps its own history."
+                        );
+                    }
+                }
                 captured += 1;
             }
             Err(e) => {

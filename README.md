@@ -27,6 +27,7 @@ makes **no network calls of its own**, and nothing it observes ever leaves your 
 - [Where things live: `~/.gurgl`](#where-things-live-gurgl)
 - [Updating](#updating)
 - [Command reference](#command-reference) · [full usage guide →](docs/USAGE.md)
+- [Using gurgl effectively](#using-gurgl-effectively)
 - [What gurgl cannot do](#what-gurgl-cannot-do-read-this)
 
 ## What gurgl is - and is deliberately not
@@ -299,6 +300,54 @@ Working from a source clone instead? `make update` (git pull + reinstall) and
 Global flags: `--config <path>` (else `./gurgl.toml`, else `~/.gurgl/gurgl.toml`),
 `--store <dir>`, `--plain` (disable the live dashboard). Every flag, the config
 schema, and flight plans are documented in **[docs/USAGE.md](docs/USAGE.md)**.
+
+## Using gurgl effectively
+
+gurgl is an egress inventory with a memory. Its value compounds with routine,
+not one-off runs:
+
+**1. Vet before you adopt.** Before adding any MCP server to Claude Code,
+Cursor, or another client, run it through gurgl first: `gurgl watch <name>`.
+You learn its network footprint before it touches your real environment. A
+filesystem tool that talks to one host is boring - that is the point. A
+"markdown converter" contacting six unknowns is a decision you now get to make
+consciously.
+
+**2. Gate upgrades with diff.** The core loop. Baseline every server you use,
+then after any update:
+
+```sh
+gurgl watch --all && gurgl diff <server>
+```
+
+A new **stable** unknown host after a version bump is exactly the
+[postmark-mcp] pattern - a package that turns malicious in a patch release. This
+is the one attack class an egress diff catches almost for free. A weekly cron of
+`watch --all` plus diff, output to a log, is the highest value-per-effort setup.
+
+**3. Commit your snapshots.** They are plain JSON receipts in
+`~/.gurgl/snapshots/`. Keep them in a git repo and you have a timestamped,
+diffable history of what your tools contacted - cheap forensics when you need to
+answer "when did this host first appear?"
+
+**4. Feed enforcement.** `gurgl allow` turns observation into policy - see below.
+
+### What it works with
+
+gurgl deliberately only observes. It pairs with tools that decide or block, and
+the `gurgl allow` formats target them directly:
+
+| Tool | Relationship |
+|------|--------------|
+| [OpenSnitch] (Linux), Little Snitch / LuLu (macOS) | Per-app firewalls that ask "allow this connection?" at runtime. gurgl answers the question they cannot: what does this tool *normally* contact? `gurgl allow <server> --format opensnitch` turns a clean baseline into rules, so the firewall only prompts on genuine anomalies. |
+| [Anthropic sandbox-runtime] | Enforces a network allowlist on the running agent. `gurgl allow --format sandbox-runtime` generates the domain list from observed behavior instead of guesswork. Observe with gurgl, enforce with the sandbox - the strongest combo. |
+| Squid or another egress proxy | The same idea at a network chokepoint: `--format squid` emits the ACL. |
+| mcp-scan (Invariant Labs) and other static scanners | An orthogonal axis. They inspect tool *descriptions and prompts* (tool poisoning, injection); gurgl inspects *runtime network behavior*. A server can pass one and fail the other - run both when vetting. |
+| Socket.dev, npm audit, dependency scanners | Supply-chain metadata: who published, what changed in the package. gurgl adds the behavioral half - what the code actually does on the wire. |
+
+The layering in one line: **scanners judge the code, gurgl witnesses the
+behavior, firewalls and sandboxes enforce the boundary.** gurgl is the middle
+layer that makes the enforcement rules evidence-based instead of guesswork.
 
 ## What gurgl cannot do (read this)
 

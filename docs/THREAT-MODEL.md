@@ -1,4 +1,4 @@
-# Threat model — what gurgl can and cannot see
+# Threat model - what gurgl can and cannot see
 
 Read this before trusting any gurgl output. The limits below are not bugs to be
 fixed later; they are properties of observing egress at the network layer, and
@@ -31,9 +31,9 @@ That's it. Host names, reproducibly, under a scripted workload.
 If a malicious server sends your data out *through a host it legitimately uses*,
 gurgl sees only that trusted host and nothing looks new.
 
-**Worked example — postmark-mcp.** The malicious version added a hardcoded BCC
+**Worked example - postmark-mcp.** The malicious version added a hardcoded BCC
 to an attacker's address. But the email was still sent via `api.postmarkapp.com`
-— the *legitimate* Postmark API. The MCP server's own egress was **unchanged**;
+ -  the *legitimate* Postmark API. The MCP server's own egress was **unchanged**;
 Postmark did the delivery to the attacker. gurgl would have shown `postmark-mcp`
 talking only to `api.postmarkapp.com`, exactly as before. **gurgl would not have
 caught postmark-mcp.** This is the same "trusted channel" wall that sinks
@@ -46,7 +46,7 @@ bytes reach a legitimate endpoint are invisible to any local network observer.
 gurgl cannot verify "we don't train on your code." Do not let it imply it can.
 
 ### 3. Content
-gurgl records hosts, not payloads. It cannot tell you *what* was sent to a host —
+gurgl records hosts, not payloads. It cannot tell you *what* was sent to a host  - 
 only that the host was contacted.
 
 ### 4. Absence
@@ -59,7 +59,7 @@ capture is **non-coverage**, not a clean bill of health.
 ## Fidelity caveats (things that can make a reading wrong)
 
 - **Server-side feature gates / A-B cohorts.** The same version can contact
-  different edge hosts on different runs. Mitigation: the reproduction gate —
+  different edge hosts on different runs. Mitigation: the reproduction gate  - 
   only hosts present in *every* trial are `Stable`/reportable. Single-run
   "drift" is never a finding.
 - **Proxy fingerprinting.** A client that detects it's behind a proxy can serve
@@ -69,6 +69,31 @@ capture is **non-coverage**, not a clean bill of health.
   support (enterprises demand TLS inspection), so capture works; but arbitrary
   long-tail MCP servers may pin or use non-HTTP transports and fall outside
   capture. Mark coverage gaps honestly rather than reporting silence as safety.
+
+## Capture fidelity
+
+TLS interception only works if the **client trusts gurgl's lab CA**. gurgl never
+installs that CA in a system trust store (it lives only under `~/.gurgl`);
+instead it injects it into the sandboxed server's environment. So whether a
+client is captured depends on whether that client honors the relevant env var:
+
+| Client | CA env var it honors | Captured? |
+|--------|----------------------|-----------|
+| Node (`npx` MCP servers) | `NODE_EXTRA_CA_CERTS` | yes, all platforms |
+| Linux `python3` (urllib/requests) | `SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE` | yes |
+| curl | `CURL_CA_BUNDLE` / `SSL_CERT_FILE` | yes |
+| **macOS system `/usr/bin/python3`** | ignores `SSL_CERT_FILE` | **no - captures 0 hosts** |
+
+The macOS system Python (3.9, LibreSSL) does not consult `SSL_CERT_FILE`, so a
+server run under it fails the TLS handshake to the proxy and its egress is never
+recorded. Most published MCP servers are Node-based and capture fine; a
+Python-based server on macOS needs a Python that honors the CA env (e.g. a
+python.org build or one that uses `certifi`), or it won't be observed. A client
+that opens raw sockets or pins its certificate also escapes capture. The tracked
+hardening step (network namespace + transparent redirect) forces *routing*
+through the proxy but does not change this: TLS capture always requires the
+client to trust the CA. Report coverage gaps honestly rather than reading
+silence as safety.
 
 ## The one-line summary to keep in your head
 

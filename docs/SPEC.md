@@ -1,15 +1,15 @@
-# gurgl — specification
+# gurgl - specification
 
 ## One sentence
 
 A local-first CLI that measures what the MCP servers you run contact on the
-network, diffs it across versions, and emits allowlists — so you notice when an
+network, diffs it across versions, and emits allowlists - so you notice when an
 install or update starts talking somewhere new.
 
 ## The one thing it does
 
 For each MCP server you run: capture its egress reproducibly under a fixed flight
-plan, store it per version, and answer *"what changed?"* — with the new-host
+plan, store it per version, and answer *"what changed?"* - with the new-host
 diff as the primary signal and a generated allowlist as the primary action.
 
 ## Users

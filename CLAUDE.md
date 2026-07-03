@@ -1,4 +1,4 @@
-# CLAUDE.md — working agreement for gurgl
+# CLAUDE.md - working agreement for gurgl
 
 This file orients any Claude Code session working in this repo. Read it before
 making changes.
@@ -14,7 +14,7 @@ network calls of its own, no telemetry.
 
 These constraints are the product. They came out of a long validation process
 that killed the more ambitious versions of this idea. Violating them doesn't
-make gurgl better — it makes it dishonest and legally exposed.
+make gurgl better - it makes it dishonest and legally exposed.
 
 1. **Inventory, not verification.** gurgl reports hosts it *observed under a
    flight plan*. It must never emit or imply "safe", "clean", "verified", or a
@@ -25,7 +25,7 @@ make gurgl better — it makes it dishonest and legally exposed.
    coverage caveat; keep it.
 3. **The reproduction gate is load-bearing.** A host seen in some-but-not-all
    trials is `Intermittent` and must never be reported as a finding or a drift
-   accusation — it's almost always server-side cohort/feature-gate noise.
+   accusation - it's almost always server-side cohort/feature-gate noise.
    Don't add code paths that surface intermittent hosts as facts.
 4. **Hosts, not payloads.** gurgl records DNS host names only. Do not add
    body/content capture. That's a different, far more fraught tool.
@@ -59,22 +59,22 @@ gurgl installs into one self-contained home, `~/.gurgl` (override with
 `cargo install --root ~/.gurgl`; `gurgl init` lays down the config + the embedded
 default flight plan + the store. Config discovery: `--config`, else
 `./gurgl.toml`, else `~/.gurgl/gurgl.toml`, else defaults. There is **no
-self-updater** (constraint #5) — updating is `make update` (git pull + reinstall).
+self-updater** (constraint #5) - updating is `make update` (git pull + reinstall).
 Path helpers live in `config.rs` (`gurgl_home()`, `default_config_path()`,
 `DEFAULT_FLIGHTPLAN`); don't hardcode paths elsewhere.
 
 ## Architecture map
 
-- `model.rs` — `Host`, `Snapshot`, `HostClass`, `Reproducibility`, `classify()`.
-- `observe.rs` — `aggregate()` (pure reproduction gate) + `capture()`/`run_trial()`
+- `model.rs` - `Host`, `Snapshot`, `HostClass`, `Reproducibility`, `classify()`.
+- `observe.rs` - `aggregate()` (pure reproduction gate) + `capture()`/`run_trial()`
   live pipeline (spawn proxy, launch sandboxed server, drive MCP over stdio,
   attribute hosts to phases by timestamp). Implemented and verified.
-- `diff.rs` — pure `diff(from, to) -> SnapshotDiff`.
-- `emit.rs` — `allowlist(snapshot, Format)` for sandbox-runtime / opensnitch / squid.
-- `store.rs` — JSON snapshots at `<store>/<server>/<version>.json`.
-- `sandbox.rs` / `proxy.rs` — `build_argv()` (pure, tested) + spawn helpers.
-- `flightplan.rs` — parse/fingerprint the scripted battery.
-- `mcp.rs` — minimal MCP JSON-RPC message builders.
+- `diff.rs` - pure `diff(from, to) -> SnapshotDiff`.
+- `emit.rs` - `allowlist(snapshot, Format)` for sandbox-runtime / opensnitch / squid.
+- `store.rs` - JSON snapshots at `<store>/<server>/<version>.json`.
+- `sandbox.rs` / `proxy.rs` - `build_argv()` (pure, tested) + spawn helpers.
+- `flightplan.rs` - parse/fingerprint the scripted battery.
+- `mcp.rs` - minimal MCP JSON-RPC message builders.
 
 ## Conventions
 
@@ -84,16 +84,16 @@ Path helpers live in `config.rs` (`gurgl_home()`, `default_config_path()`,
   library code. User-facing errors should say what to do next.
 - Match the existing comment density: comments state *constraints and why*, not
   what the next line does.
-- Any new dependency is a supply-chain decision — this is a security tool.
+- Any new dependency is a supply-chain decision - this is a security tool.
   Prefer std; justify additions; keep `cargo deny` / `cargo audit` green.
 
 ## Next tasks (v1 polish)
 
 The live capture (`observe::run_trial`) works. Remaining:
-- **Version derivation** — resolve the actually-installed version of an npm/PyPI
+- **Version derivation** - resolve the actually-installed version of an npm/PyPI
   MCP server instead of the `unknown` label / config value.
-- **Capture hardening** — force all egress through the proxy (network namespace
+- **Capture hardening** - force all egress through the proxy (network namespace
   + transparent redirect on Linux; a real least-privilege Seatbelt profile on
   macOS) instead of relying on the client honoring `HTTPS_PROXY`. The sandbox is
   functional but explicitly not a boundary yet (docs/THREAT-MODEL.md).
-- **Capture fidelity notes** — per-target flags for known proxy-fingerprinting.
+- **Capture fidelity notes** - per-target flags for known proxy-fingerprinting.

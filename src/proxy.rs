@@ -3,7 +3,7 @@
 //! gurgl spawns `mitmdump` with the bundled addon (assets/mitm_flows.py), which
 //! appends one JSON line per request recording the destination host and time.
 //! gurgl reads that file back to build the per-trial host set. Hosts + time
-//! only — never bodies.
+//! only - never bodies.
 //!
 //! A pure-Rust MITM backend (`hudsucker`) that removes the mitmproxy dependency
 //! is a roadmap item; this module isolates that behind `build_argv`/`parse_flows`.

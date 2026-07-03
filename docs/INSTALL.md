@@ -15,7 +15,7 @@ you can inspect, back up, or delete.
 ```
 
 - **Supported today:** Linux and macOS (Apple Silicon & Intel).
-- **Windows:** not yet — [tracked for later](ROADMAP.md).
+- **Windows:** not yet - [tracked for later](ROADMAP.md).
 
 ---
 
@@ -28,14 +28,15 @@ cd gurgl && ./install.sh
 gurgl --version
 ```
 
-Then install the two capture deps for your OS (only needed for `gurgl watch`),
-below.
+`./install.sh` also installs the capture deps (sandbox backend + mitmproxy)
+automatically. The per-OS commands in step 3 are for reference or if you ran
+`./install.sh --no-deps`.
 
 ---
 
 ## 1. Install the binary
 
-### Option A — the installer script (recommended)
+### Option A - the installer script (recommended)
 
 Works on Linux and macOS. It installs the Rust toolchain if missing, builds
 gurgl, installs it to `~/.gurgl/bin`, and writes `~/.gurgl/env`.
@@ -52,7 +53,7 @@ Custom location:
 GURGL_HOME="$HOME/tools/gurgl" ./install.sh
 ```
 
-### Option B — with cargo directly
+### Option B - with cargo directly
 
 If you already have Rust ([rustup.rs](https://rustup.rs)):
 
@@ -91,14 +92,26 @@ gurgl --config examples/gurgl.toml diff example-mcp   # works with no backend
 
 ## 3. Install the capture backends (only for `gurgl watch`)
 
+**`./install.sh` already installs these for you** (unless you passed
+`--no-deps`). This section is reference: what the deps are, and how to install
+them by hand if the automatic step couldn't.
+
 `list` / `show` / `diff` / `allow` work with nothing extra. **Capture** needs
 two things: a **sandbox** to run the server in, and **mitmproxy** to observe its
 TLS egress.
 
+> **macOS capture caveat.** mitmproxy intercepts TLS with a local CA that the
+> client must trust. gurgl passes that CA via env vars: **Node** honors
+> `NODE_EXTRA_CA_CERTS` on every platform (so `npx`-based MCP servers capture
+> fine), but the macOS **system `python3` ignores `SSL_CERT_FILE`** and won't
+> trust it, so a server run under `/usr/bin/python3` captures **zero** hosts on
+> macOS. gurgl deliberately does not add its CA to the system trust store. See
+> [THREAT-MODEL.md](THREAT-MODEL.md#capture-fidelity).
+
 ### macOS
 
 ```sh
-# sandbox: sandbox-exec ships with macOS — nothing to install.
+# sandbox: sandbox-exec ships with macOS - nothing to install.
 # capture proxy:
 brew install mitmproxy
 ```
@@ -198,7 +211,7 @@ Remote hosts: `make deploy HOST=my-mac` re-syncs and rebuilds.
 ## Uninstall
 
 ```sh
-rm -rf ~/.gurgl               # binary, config, snapshots, CA — everything
+rm -rf ~/.gurgl               # binary, config, snapshots, CA - everything
 ```
 
 Remove the `. "$HOME/.gurgl/env"` line from your shell profile. The lab CA lived

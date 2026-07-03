@@ -22,11 +22,11 @@ first ([INSTALL.md](INSTALL.md)), then read this top to bottom once.
    MCP session). It does this **N times**.
 3. Every host the server contacted is recorded, classified, and marked **stable**
    (seen in every trial) or **intermittent** (not). The result is a **snapshot**
-   — one JSON file per `server@version`.
+   - one JSON file per `server@version`.
 4. You **diff** snapshots across versions (new hosts = the signal) and **emit**
    allowlists for an enforcement engine.
 
-gurgl reports what it **observed**. It never certifies a tool as safe — see
+gurgl reports what it **observed**. It never certifies a tool as safe - see
 [THREAT-MODEL.md](THREAT-MODEL.md).
 
 ---
@@ -52,7 +52,7 @@ gurgl reports what it **observed**. It never certifies a tool as safe — see
 ### `gurgl init`
 
 Creates the self-contained home: `~/.gurgl/gurgl.toml`, the default flight plan,
-and the snapshot store. Idempotent — existing files are left untouched.
+and the snapshot store. Idempotent - existing files are left untouched.
 
 ```console
 $ gurgl init
@@ -76,12 +76,12 @@ filesystem-mcp
 
 ### `gurgl show`
 
-`gurgl show <server> [version]` — show the hosts observed for a version
+`gurgl show <server> [version]` - show the hosts observed for a version
 (default: the latest captured).
 
 ```console
 $ gurgl show filesystem-mcp
-filesystem-mcp@1.3.0  (5 trials, flight plan default-…)
+filesystem-mcp@1.3.0  (5 trials, flight plan default-...)
 HOST                                     CLASS        REPRO        SEEN
 api.github.com                           registry     stable       5/5
 telemetry.vendor.com                     telemetry    stable       5/5
@@ -93,7 +93,7 @@ cdn.unknown-3p.net                       unknown      stable       5/5
 
 ### `gurgl watch`
 
-`gurgl watch <server>` or `gurgl watch --all` — the capture. Launches each
+`gurgl watch <server>` or `gurgl watch --all` - the capture. Launches each
 server in the sandbox behind the proxy and drives the flight plan `trials` times.
 **Requires** mitmproxy (`mitmdump`) and a sandbox backend; it preflights both and
 stops with a clear message if one is missing.
@@ -114,7 +114,7 @@ version overwrites it.
 
 ### `gurgl diff`
 
-`gurgl diff <server>` — compare two versions (default: the two most recent). Use
+`gurgl diff <server>` - compare two versions (default: the two most recent). Use
 `--from <v> --to <v>` to pick. **New stable hosts are the signal.**
 
 ```console
@@ -125,7 +125,7 @@ filesystem-mcp: 1.2.0 -> 1.3.0
     + telemetry.vendor.com                     [telemetry]
     + cdn.unknown-3p.net                        [unknown]
 
-  ⚠ 1 new stable UNKNOWN host(s) — worth a look:
+  ⚠ 1 new stable UNKNOWN host(s) - worth a look:
     cdn.unknown-3p.net
 
 note: presence only. Absence of a host is non-coverage under this flight plan,
@@ -137,7 +137,7 @@ finding.
 
 ### `gurgl allow`
 
-`gurgl allow <server> [version] --format <fmt>` — emit an allowlist from a
+`gurgl allow <server> [version] --format <fmt>` - emit an allowlist from a
 snapshot, to stdout. Formats: `sandbox-runtime` (default), `opensnitch`, `squid`.
 
 ```console
@@ -149,7 +149,7 @@ http_access allow gurgl_filesystem_mcp
 $ gurgl allow filesystem-mcp --format sandbox-runtime > allow.txt
 ```
 
-An allowlist reflects only what was **observed** under the flight plan — it is a
+An allowlist reflects only what was **observed** under the flight plan - it is a
 starting point to review, not a complete contract.
 
 ---
@@ -182,13 +182,13 @@ name = "filesystem-mcp"                    # logical name (used for storage + CL
 command = "npx"                            # launched INSIDE the sandbox
 args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp/scratch"]
 version = "1.3.0"                          # optional; else labeled "unknown"
-first_party = ["vendor.com"]               # domains you EXPECT — classified first-party
+first_party = ["vendor.com"]               # domains you EXPECT - classified first-party
 ```
 
 | Field | Required | Notes |
 |-------|----------|-------|
 | `name` | yes | Storage + CLI identity. |
-| `command` | yes | Executable run inside the sandbox (`npx`, `python3`, `node`, …). |
+| `command` | yes | Executable run inside the sandbox (`npx`, `python3`, `node`, ...). |
 | `args` | no | Arguments to `command`. |
 | `version` | no | Explicit label; absent → `unknown`. |
 | `first_party` | no | Expected domains, so gurgl can class them as first-party. |
@@ -210,7 +210,7 @@ first_party = ["vendor.com"]               # domains you EXPECT — classified f
 ## Flight plans
 
 A flight plan is the fixed, ordered MCP session gurgl runs so egress is exercised
-the same way every time. It is fingerprinted into each snapshot — change the plan
+the same way every time. It is fingerprinted into each snapshot - change the plan
 and past snapshots are no longer directly comparable.
 
 ```toml
@@ -248,8 +248,8 @@ Every observed host is put in one class, used to make diffs readable:
 |-------|---------|
 | **first-party** | Matches a `first_party` domain you declared for the server. |
 | **telemetry** | Known analytics/telemetry endpoints. |
-| **registry** | Package registries / code hosts (npm, PyPI, GitHub, …). |
-| **unknown** | Everything else — **the class to scrutinize**, especially when new. |
+| **registry** | Package registries / code hosts (npm, PyPI, GitHub, ...). |
+| **unknown** | Everything else - **the class to scrutinize**, especially when new. |
 
 A **new stable `unknown`** host after an update is the loudest thing gurgl can
 tell you.
@@ -264,14 +264,14 @@ rotation). To avoid crying "drift" at noise, gurgl runs `trials` captures and:
 - a host in **every** trial → **stable** (reportable),
 - a host in **some** trials → **intermittent** (shown, but never a finding).
 
-Raise `trials` for noisier servers. This gate is load-bearing — see
+Raise `trials` for noisier servers. This gate is load-bearing - see
 [ARCHITECTURE.md](ARCHITECTURE.md#the-reproduction-gate).
 
 ---
 
 ## Reading a snapshot
 
-Snapshots are plain JSON you own — read, diff, and commit them:
+Snapshots are plain JSON you own - read, diff, and commit them:
 
 ```jsonc
 // ~/.gurgl/snapshots/filesystem-mcp/1.3.0.json
@@ -280,7 +280,7 @@ Snapshots are plain JSON you own — read, diff, and commit them:
   "version": "1.3.0",
   "captured_at": 1751500000,
   "trials": 5,
-  "flightplan": "default-a1b2c3…",   // fingerprint tying this to its method
+  "flightplan": "default-a1b2c3...",   // fingerprint tying this to its method
   "gurgl_version": "0.1.0",
   "hosts": [
     { "name": "cdn.unknown-3p.net", "class": "unknown",

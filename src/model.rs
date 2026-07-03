@@ -70,7 +70,7 @@ pub struct Snapshot {
     pub version: String,
     /// Unix seconds. Set by the capturer; not used for any trust claim.
     pub captured_at: u64,
-    /// N — the number of trials aggregated into this snapshot.
+    /// N - the number of trials aggregated into this snapshot.
     pub trials: u32,
     /// Name of the flight plan used (bind the observation to the method).
     pub flightplan: String,
@@ -111,7 +111,7 @@ pub fn classify(name: &str, first_party: &[String]) -> HostClass {
 
 /// `name` equals `pat` or is a subdomain of `pat`. Substring-only patterns
 /// (those containing no dot at the boundary, like "analytics.") also match as a
-/// contained label prefix — kept intentionally simple and auditable.
+/// contained label prefix - kept intentionally simple and auditable.
 fn host_matches(name: &str, pat: &str) -> bool {
     let pat = pat.to_ascii_lowercase();
     if name == pat || name.ends_with(&format!(".{pat}")) {

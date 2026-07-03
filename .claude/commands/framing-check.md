@@ -14,7 +14,7 @@ Check specifically:
 5. **No telemetry.** Any new outbound network call, analytics, or update ping
    from gurgl itself?
 6. **Threat-model honesty.** Does anything imply gurgl detects exfiltration or
-   sees server-side behavior? (It cannot — docs/THREAT-MODEL.md.)
+   sees server-side behavior? (It cannot - docs/THREAT-MODEL.md.)
 7. **Publishing gate.** Does the change add a publish/share feature that names
    third parties without following docs/PUBLISHING.md?
 

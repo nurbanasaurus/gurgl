@@ -45,7 +45,7 @@ fn allowlisted(snapshot: &Snapshot) -> Vec<&Host> {
 }
 
 const CAVEAT: &str =
-    "absence of a host means gurgl did not observe it under this flight plan — NOT that the tool will never contact it. Review before enforcing.";
+    "absence of a host means gurgl did not observe it under this flight plan - NOT that the tool will never contact it. Review before enforcing.";
 
 pub fn allowlist(snapshot: &Snapshot, format: Format) -> String {
     let hosts = allowlisted(snapshot);

@@ -26,7 +26,7 @@ install:
 	./install.sh
 
 # Update in place: pull the latest source, then reinstall. gurgl never
-# self-updates (it makes no network calls of its own) — this is the update path.
+# self-updates (it makes no network calls of its own) - this is the update path.
 update:
 	git pull --ff-only
 	./install.sh

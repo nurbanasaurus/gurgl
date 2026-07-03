@@ -35,7 +35,7 @@ impl SnapshotDiff {
             .collect()
     }
 
-    /// Stable additions that we could not classify — the sharpest signal.
+    /// Stable additions that we could not classify - the sharpest signal.
     pub fn stable_unknown_added(&self) -> Vec<&HostDelta> {
         self.stable_added()
             .into_iter()

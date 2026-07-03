@@ -32,7 +32,7 @@ files) touches the OS.
 
 ## Why Rust + external mitmproxy
 
-- **Single static binary** to distribute — right for a security tool people
+- **Single static binary** to distribute - right for a security tool people
   install and audit.
 - **mitmproxy is the proven TLS-capture engine.** gurgl treats `mitmdump` as a
   subprocess and reads its output via a tiny embedded addon
@@ -50,7 +50,7 @@ v1 uses **env-proxy capture**: the sandboxed child gets `HTTPS_PROXY` +
 honor these, so their real egress is captured.
 
 The gap: a client that *ignores* proxy env vars, or that opens raw sockets,
-escapes capture. Closing it is the tracked hardening step — run the child in its
+escapes capture. Closing it is the tracked hardening step - run the child in its
 own network namespace where the only reachable route is a transparent redirect
 (nftables `REDIRECT`/`TPROXY`) to the proxy, and block UDP/443 to force
 HTTP/2-over-TCP (so QUIC/HTTP-3 can't bypass). Until then, capture is honest for
@@ -82,4 +82,4 @@ benign `tools/call` over stdio, tears everything down with drop guards (no
 leaked processes), then reads flows and attributes each host to a flight-plan
 phase by timestamp. Verified end-to-end against a live server contacting known
 hosts. What remains is hardening (forcing *all* egress through the proxy) and
-version derivation — see docs/ROADMAP.md.
+version derivation - see docs/ROADMAP.md.

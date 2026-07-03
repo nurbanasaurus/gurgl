@@ -1,7 +1,7 @@
 //! On-disk snapshot storage.
 //!
 //! One JSON file per capture: `<root>/<server>/<version>.json`. Plain files, no
-//! database — snapshots are meant to be human-readable receipts you can diff,
+//! database - snapshots are meant to be human-readable receipts you can diff,
 //! commit, and inspect. Nothing here phones home.
 
 use std::path::{Path, PathBuf};

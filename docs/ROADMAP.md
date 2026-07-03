@@ -4,7 +4,7 @@ gurgl is intentionally small. The roadmap is about *finishing v1 well* and
 staying inside the honest scope, not about growing into a platform. The ceiling
 is deliberate (see the note at the end).
 
-## v1 — the personal tool (in progress)
+## v1 - the personal tool (in progress)
 
 **Goal:** you get daily value on your own machine, every time you install or
 update an MCP server.
@@ -15,21 +15,21 @@ update an MCP server.
 - [x] Allowlist emit (sandbox-runtime / OpenSnitch / squid).
 - [x] Sandbox + proxy command construction (bubblewrap default, podman, Seatbelt).
 - [x] Embedded mitmproxy addon + flow parsing.
-- [x] **Live capture** (`observe::run_trial`) — spawn proxy, launch sandboxed
+- [x] **Live capture** (`observe::run_trial`) - spawn proxy, launch sandboxed
       server through it, drive MCP over stdio, attribute hosts to phases by
       timestamp. Verified end-to-end against a live server.
 - [ ] Version derivation (resolve the actual installed version of an npm/PyPI
       MCP server instead of the config label).
 - [ ] `watch` ergonomics: progress, timing, partial-capture handling.
 
-## v1.1 — capture hardening
+## v1.1 - capture hardening
 
 - [ ] Network-namespace + transparent redirect so *all* egress is forced
       through the proxy (not just proxy-env-honoring clients); block UDP/443.
 - [ ] Per-target fidelity notes (known proxy-fingerprinting / pinning).
 - [ ] Pure-Rust MITM backend (`hudsucker`) as an alternative to mitmdump.
 
-## v2 — the community catalog (only as exhaust, only with guardrails)
+## v2 - the community catalog (only as exhaust, only with guardrails)
 
 If and only if the personal tool is genuinely useful and you're already running
 it, a *static* community catalog of observed host sets per MCP-server@version
@@ -62,5 +62,5 @@ Stop or downscope if:
 gurgl is a respected local tool + reputation asset, not a venture. It clears
 "one thing done well", "daily personal benefit", and "grows into something with
 meaning". It does **not** claim a defensible moat, and that's an accepted,
-eyes-open trade — see the project notes that led here. Build the small true
+eyes-open trade - see the project notes that led here. Build the small true
 thing; let it earn the right to become more.

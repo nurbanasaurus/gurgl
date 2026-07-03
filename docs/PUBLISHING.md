@@ -5,7 +5,7 @@ third party** ("`some-mcp`@1.4 contacts `beacon.example`"), you take on legal an
 ethical exposure that a private tool never has. These rules are the price of
 publishing. They are not optional, and they are deliberately conservative.
 
-If you are not publishing named observations, none of this applies — run the
+If you are not publishing named observations, none of this applies - run the
 tool locally and enjoy it.
 
 ## Before you publish anything that names a vendor
@@ -29,13 +29,13 @@ tool locally and enjoy it.
    Let readers draw conclusions; you report what the proxy logged.
 4. **Reproduction gate is mandatory for anything published.** Only host sets that
    reproduced across all N trials, with cohort identity pinned. Never publish a
-   single-run observation — server-side feature gates will otherwise turn benign
+   single-run observation - server-side feature gates will otherwise turn benign
    A-B rollout into a false accusation, which is simultaneously your legal
    trigger and the death of your credibility.
 5. **Coordinated pre-disclosure, always.** Notify the vendor/author and give a
-   fixed window (e.g. 30–90 days) before any writeup. Publish their response
+   fixed window (e.g. 30-90 days) before any writeup. Publish their response
    alongside your observation. This converts "undocumented endpoint!" into "here
-   is the maintainer's explanation" — the single strongest legal *and* ethical
+   is the maintainer's explanation" - the single strongest legal *and* ethical
    de-risker.
 6. **Never punch down.** The tool's most attention-grabbing findings will tend to
    land on hobbyist/solo MCP authors (the best-documented vendors have the least
@@ -48,13 +48,13 @@ tool locally and enjoy it.
 - No live "is this tool safe?" verdict service.
 - No "verified / certified clean" badges.
 - No payload contents in any published artifact.
-- No implying gurgl detects exfiltration or sees server-side behavior — it does
+- No implying gurgl detects exfiltration or sees server-side behavior - it does
   not (docs/THREAT-MODEL.md).
 
 ## The honest cost
 
 Following these rules makes published output *less* sensational and *slower* to
-build a reputation — the safe version is the boring-receipts version. That is
+build a reputation - the safe version is the boring-receipts version. That is
 the correct trade. The reputational upside of being the careful, independent,
 never-wrong observer only exists if you are, in fact, careful and never
 recklessly wrong.

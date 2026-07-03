@@ -7,7 +7,7 @@
 # mitmdump's environment is fixed at launch, so time is the reliable join key).
 #
 # We record the HOST and TIME ONLY, never request/response bodies. gurgl is an
-# egress *inventory* tool, not a payload interceptor — see docs/THREAT-MODEL.md.
+# egress *inventory* tool, not a payload interceptor - see docs/THREAT-MODEL.md.
 
 import json
 import os

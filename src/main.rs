@@ -1,4 +1,4 @@
-//! gurgl — local-first egress hygiene for MCP servers.
+//! gurgl - local-first egress hygiene for MCP servers.
 //!
 //! Capture what an MCP server contacts on the network, diff it across versions,
 //! and emit allowlists you can enforce elsewhere. gurgl reports what it
@@ -84,7 +84,7 @@ fn cmd_init(store: &Store) -> Result<()> {
     let cfg_path = config::default_config_path();
     if cfg_path.exists() {
         println!(
-            "{} already exists — leaving it untouched.",
+            "{} already exists - leaving it untouched.",
             cfg_path.display()
         );
     } else {
@@ -175,14 +175,14 @@ fn cmd_diff(store: &Store, server: &str, from: Option<&str>, to: Option<&str>) -
             let flag = if delta.reproducibility == Reproducibility::Stable {
                 "" // stable: a real change
             } else {
-                "  (intermittent — likely cohort noise, not a finding)"
+                "  (intermittent - likely cohort noise, not a finding)"
             };
             println!("    + {:<40} [{}]{}", delta.name, delta.class, flag);
         }
         let unknown = d.stable_unknown_added();
         if !unknown.is_empty() {
             println!(
-                "\n  ⚠ {} new stable UNKNOWN host(s) — worth a look:",
+                "\n  ⚠ {} new stable UNKNOWN host(s) - worth a look:",
                 unknown.len()
             );
             for u in unknown {

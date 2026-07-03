@@ -49,7 +49,7 @@ pub struct ServerSpec {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
-    /// Where snapshots are stored. `~` is expanded. Default: XDG data dir.
+    /// Where snapshots are stored. `~` is expanded. Default: `~/.gurgl/snapshots`.
     #[serde(default)]
     pub store: Option<String>,
     #[serde(default)]
@@ -156,7 +156,7 @@ fn expand_tilde(s: &str) -> PathBuf {
 
 /// gurgl's self-contained home directory: `$GURGL_HOME` if set, else `~/.gurgl`.
 ///
-/// Everything gurgl needs lives under here — the binary (`bin/`), `gurgl.toml`,
+/// Everything gurgl needs lives under here - the binary (`bin/`), `gurgl.toml`,
 /// `flightplans/`, the snapshot store (`snapshots/`), and the lab CA
 /// (`mitmproxy/`). One directory you can inspect, back up, or `rm -rf`.
 pub fn gurgl_home() -> PathBuf {

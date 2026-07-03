@@ -7,8 +7,8 @@
 //!
 //! ## v1 status
 //! `build_argv` (pure command construction) is implemented and tested. Actually
-//! forcing *all* egress through the proxy — rather than relying on the client to
-//! honor `HTTPS_PROXY` — is the hardening step tracked in docs/ROADMAP.md
+//! forcing *all* egress through the proxy - rather than relying on the client to
+//! honor `HTTPS_PROXY` - is the hardening step tracked in docs/ROADMAP.md
 //! (`--v1-hardening: transparent redirect`). For cooperating clients (Node/npm,
 //! which honor `HTTPS_PROXY` + `NODE_EXTRA_CA_CERTS`) the env-proxy path already
 //! captures real egress; the transparent-redirect layer closes the gap for
@@ -57,7 +57,7 @@ pub fn build_argv(kind: SandboxKind, spec: &ServerSpec, env: &ProxyEnv) -> Vec<S
     }
 }
 
-/// macOS Seatbelt profile. v1 starting point — NOT a hardened boundary yet.
+/// macOS Seatbelt profile. v1 starting point - NOT a hardened boundary yet.
 /// A real least-privilege profile (deny-by-default filesystem, network only to
 /// the proxy) is the hardening task mirroring the Linux netns work; see
 /// docs/ROADMAP.md. Kept deliberately simple and readable until then.

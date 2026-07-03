@@ -34,11 +34,11 @@ pub fn aggregate(trials: &[Vec<FlowHost>], first_party: &[String]) -> Vec<Host> 
         let mut counted: BTreeSet<&str> = BTreeSet::new();
         for fh in trial {
             let entry = acc.entry(fh.host.clone()).or_insert((0, Vec::new()));
-            // Count each host at most once per trial (for the reproduction gate)…
+            // Count each host at most once per trial (for the reproduction gate)...
             if counted.insert(fh.host.as_str()) {
                 entry.0 += 1;
             }
-            // …but union its phases across every occurrence in the trial.
+            // ...but union its phases across every occurrence in the trial.
             if let Some(phase) = &fh.phase {
                 if !entry.1.contains(phase) {
                     entry.1.push(phase.clone());

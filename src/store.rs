@@ -3,12 +3,41 @@
 //! One JSON file per capture: `<root>/<server>/<version>.json`. Plain files, no
 //! database - snapshots are meant to be human-readable receipts you can diff,
 //! commit, and inspect. Nothing here phones home.
+//!
+//! Two human-review sidecars live next to a server's snapshots:
+//! - `acks.toml` - hosts the user has reviewed (`gurgl ack`), so diff can report
+//!   them quietly instead of re-alerting. An ack records a decision and its
+//!   context; it is never an endorsement of the host.
+//! - `baseline` - the version the user accepted as reviewed (`gurgl accept`),
+//!   so diff/audit runs compare against what a human actually looked at.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 
 use crate::model::Snapshot;
+
+/// One acknowledged host: the user reviewed it and recorded why. Wording is
+/// deliberate - "acknowledged", never "approved" or "safe".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ack {
+    pub host: String,
+    /// The user's reason, verbatim.
+    #[serde(default)]
+    pub note: Option<String>,
+    /// YYYY-MM-DD the ack was recorded.
+    pub date: String,
+    /// The server version that was latest when the user reviewed it.
+    #[serde(default)]
+    pub reviewed_at_version: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct AckFile {
+    #[serde(default)]
+    acks: Vec<Ack>,
+}
 
 pub struct Store {
     root: PathBuf,
@@ -115,5 +144,152 @@ impl Store {
 
     pub fn latest(&self, server: &str) -> Result<Option<String>> {
         Ok(self.versions(server)?.pop())
+    }
+
+    // ---- acknowledgements (acks.toml sidecar) --------------------------------
+
+    fn acks_path(&self, server: &str) -> PathBuf {
+        self.root.join(server).join("acks.toml")
+    }
+
+    /// The user's acknowledged hosts for this server (empty if none recorded).
+    pub fn acks(&self, server: &str) -> Result<Vec<Ack>> {
+        let path = self.acks_path(server);
+        if !path.is_file() {
+            return Ok(Vec::new());
+        }
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        let file: AckFile =
+            toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        Ok(file.acks)
+    }
+
+    /// Add or update an ack (by host name). Returns whether it replaced one.
+    pub fn add_ack(&self, server: &str, ack: Ack) -> Result<bool> {
+        let mut acks = self.acks(server)?;
+        let replaced = if let Some(existing) = acks.iter_mut().find(|a| a.host == ack.host) {
+            *existing = ack;
+            true
+        } else {
+            acks.push(ack);
+            false
+        };
+        self.write_acks(server, &acks)?;
+        Ok(replaced)
+    }
+
+    /// Remove an ack by host name. Returns whether one existed.
+    pub fn remove_ack(&self, server: &str, host: &str) -> Result<bool> {
+        let mut acks = self.acks(server)?;
+        let before = acks.len();
+        acks.retain(|a| a.host != host);
+        let removed = acks.len() != before;
+        if removed {
+            self.write_acks(server, &acks)?;
+        }
+        Ok(removed)
+    }
+
+    fn write_acks(&self, server: &str, acks: &[Ack]) -> Result<()> {
+        let path = self.acks_path(server);
+        std::fs::create_dir_all(path.parent().unwrap())
+            .with_context(|| format!("creating {}", path.parent().unwrap().display()))?;
+        let file = AckFile {
+            acks: acks.to_vec(),
+        };
+        let text = format!(
+            "# Hosts you have reviewed for this server (`gurgl ack`). An ack means\n\
+             # \"a human looked at this and recorded why\" - it is not an endorsement.\n\
+             # diff reports acknowledged hosts quietly instead of re-alerting.\n\n{}",
+            toml::to_string_pretty(&file).context("serializing acks")?
+        );
+        std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))
+    }
+
+    // ---- reviewed baseline (baseline sidecar) --------------------------------
+
+    fn baseline_path(&self, server: &str) -> PathBuf {
+        self.root.join(server).join("baseline")
+    }
+
+    /// The version the user accepted as reviewed baseline, if any.
+    pub fn baseline(&self, server: &str) -> Option<String> {
+        let v = std::fs::read_to_string(self.baseline_path(server)).ok()?;
+        let v = v.trim().to_string();
+        (!v.is_empty()).then_some(v)
+    }
+
+    /// Set (or with `None`, clear) the reviewed-baseline pointer.
+    pub fn set_baseline(&self, server: &str, version: Option<&str>) -> Result<()> {
+        let path = self.baseline_path(server);
+        match version {
+            Some(v) => {
+                std::fs::create_dir_all(path.parent().unwrap())
+                    .with_context(|| format!("creating {}", path.parent().unwrap().display()))?;
+                std::fs::write(&path, format!("{v}\n"))
+                    .with_context(|| format!("writing {}", path.display()))
+            }
+            None => {
+                if path.exists() {
+                    std::fs::remove_file(&path)
+                        .with_context(|| format!("removing {}", path.display()))?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Unique per test name: tests run in parallel within one process, so a
+    /// pid-keyed dir would be shared and the cleanup of one races the other.
+    fn temp_store(tag: &str) -> (Store, PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("gurgl-store-test-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        (Store::new(dir.clone()), dir)
+    }
+
+    #[test]
+    fn acks_round_trip_update_and_remove() {
+        let (store, dir) = temp_store("acks");
+        assert!(store.acks("srv").unwrap().is_empty());
+
+        let ack = Ack {
+            host: "cdn.example.net".into(),
+            note: Some("CDN used by the pdf renderer".into()),
+            date: "2026-07-04".into(),
+            reviewed_at_version: Some("1.3.0".into()),
+        };
+        assert!(!store.add_ack("srv", ack.clone()).unwrap()); // new
+        assert_eq!(store.acks("srv").unwrap(), vec![ack.clone()]);
+
+        // Re-acking the same host replaces, not duplicates.
+        let updated = Ack {
+            note: Some("still expected".into()),
+            ..ack
+        };
+        assert!(store.add_ack("srv", updated.clone()).unwrap());
+        assert_eq!(store.acks("srv").unwrap(), vec![updated]);
+
+        assert!(store.remove_ack("srv", "cdn.example.net").unwrap());
+        assert!(!store.remove_ack("srv", "cdn.example.net").unwrap());
+        assert!(store.acks("srv").unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn baseline_set_get_clear() {
+        let (store, dir) = temp_store("baseline");
+        assert_eq!(store.baseline("srv"), None);
+        store.set_baseline("srv", Some("1.2.0")).unwrap();
+        assert_eq!(store.baseline("srv"), Some("1.2.0".into()));
+        store.set_baseline("srv", None).unwrap();
+        assert_eq!(store.baseline("srv"), None);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

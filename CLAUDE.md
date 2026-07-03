@@ -92,7 +92,10 @@ Path helpers live in `config.rs` (`gurgl_home()`, `default_config_path()`,
   `--dir`) so the starter config works out of the box.
 - `diff.rs` - pure `diff(from, to) -> SnapshotDiff`.
 - `emit.rs` - `allowlist(snapshot, Format)` for sandbox-runtime / opensnitch / squid.
-- `store.rs` - JSON snapshots at `<store>/<server>/<version>.json`.
+- `store.rs` - JSON snapshots at `<store>/<server>/<version>.json`, plus two
+  human-review sidecars per server: `acks.toml` (`gurgl ack` - reviewed hosts,
+  worded "acknowledged" never "approved") and `baseline` (`gurgl accept` - the
+  version a human reviewed; `diff --baseline`/`watch --diff` compare against it).
 - `sandbox.rs` / `proxy.rs` - `build_argv()` (pure, tested) + spawn helpers.
 - `flightplan.rs` - parse/fingerprint the scripted battery; `Step::args` (TOML
   table) lets a `tools/call` step pass real arguments, folded into the fingerprint.
@@ -114,6 +117,12 @@ Path helpers live in `config.rs` (`gurgl_home()`, `default_config_path()`,
   unit-testable; put process/FS/network in the edge modules.
 - Errors: `anyhow` in `main`/commands, plain `Result` with `.context(...)` in
   library code. User-facing errors should say what to do next.
+- Exit codes are a documented contract: 0 = ok/no drift, 1 = drift
+  (`diff --check`, `watch --diff`), 2 = error. `run()` returns the code; don't
+  add new nonzero meanings casually. `--json` outputs carry a versioned
+  `schema` field (`gurgl.diff/1` ...) - breaking a schema needs a version bump.
+  The drift gate (`drift_hosts` in main.rs) honors acks and never counts
+  intermittent hosts (the reproduction gate applies to automation too).
 - Match the existing comment density: comments state *constraints and why*, not
   what the next line does.
 - Any new dependency is a supply-chain decision - this is a security tool.

@@ -5,16 +5,18 @@
 //! to somewhere new?" We carry each delta's reproducibility so the caller can
 //! separate stable changes (report) from intermittent ones (cohort noise).
 
+use serde::Serialize;
+
 use crate::model::{HostClass, Reproducibility, Snapshot};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct HostDelta {
     pub name: String,
     pub class: HostClass,
     pub reproducibility: Reproducibility,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SnapshotDiff {
     pub server: String,
     pub from_version: String,

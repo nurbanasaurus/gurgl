@@ -256,6 +256,59 @@ $ gurgl allow filesystem-mcp --format sandbox-runtime > allow.txt
 An allowlist reflects only what was **observed** under the flight plan - it is a
 starting point to review, not a complete contract.
 
+### `gurgl ack`
+
+`gurgl ack <server> <host> [--note "..."]` - record that you reviewed a host, so
+`diff` reports it in a quiet one-liner instead of re-alerting on every run. The
+ack stores your note, the date, and the version you reviewed at, in a
+human-editable sidecar (`<store>/<server>/acks.toml`) you can commit to git.
+
+```console
+$ gurgl ack example-mcp beacon.cdn.example --note "static assets for the pdf tool"
+$ gurgl ack example-mcp --list
+$ gurgl ack example-mcp beacon.cdn.example --remove
+```
+
+An ack means "a human looked at this and recorded why" - it is **not** an
+endorsement, and gurgl still cannot see what is *sent* to an acknowledged host.
+`diff --check` and `watch --diff` honor acks: acknowledged hosts do not trip the
+drift gate.
+
+### `gurgl accept`
+
+`gurgl accept <server> [version]` - mark a reviewed capture as this server's
+**baseline** (default: the latest). `gurgl diff <server> --baseline` and
+`watch --diff` then compare against what you actually reviewed instead of just
+the latest two versions - so drift accumulates against your last review, not
+against yesterday's unreviewed capture. `--clear` removes the pointer; `list`
+marks the baseline version.
+
+### Automation: `--check`, `watch --diff`, `--json`, and exit codes
+
+**Exit codes** (grep convention): `0` = success / no drift at the requested
+threshold, `1` = drift detected, `2` = error.
+
+**`gurgl diff <server> --check[=unknown|any]`** exits 1 when new stable hosts
+were observed: `unknown` (the default) triggers only on hosts needing scrutiny
+(`unknown` / `telemetry?`), `any` on every new stable host. Acks are honored.
+Intermittent hosts never trip the gate - the reproduction gate applies to
+automation too.
+
+**`gurgl watch --all --diff`** is the one-shot audit: capture every server, diff
+each against its accepted baseline (else its previous version), print a
+per-server drift summary, and exit 1 if anything needs scrutiny. Made for cron -
+see [RECIPES.md](RECIPES.md).
+
+**`--json`** switches `list`, `show`, `diff`, and `discover` to stable,
+versioned JSON on stdout (`gurgl.diff/1` etc.). The epistemic caveat travels in
+a `note` field; `diff` JSON carries `needs_scrutiny` (acks already subtracted)
+and `acknowledged_present` separately so scripts do not re-alert on reviewed
+hosts.
+
+```sh
+gurgl --json diff my-server | jq -r '.needs_scrutiny[]'
+```
+
 ### `gurgl update`
 
 `gurgl update` (or `gurgl -u` / `gurgl --update`) - update gurgl from the public

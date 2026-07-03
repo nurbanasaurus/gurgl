@@ -28,6 +28,11 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub plain: bool,
 
+    /// Machine-readable JSON on stdout for list/show/diff/discover. Each object
+    /// carries a `schema` field; the human caveats travel as a `note` field.
+    #[arg(long, global = true)]
+    pub json: bool,
+
     /// Update gurgl from the public repo and reinstall (same as `gurgl update`).
     #[arg(short = 'u', long = "update", global = true)]
     pub update: bool,
@@ -57,6 +62,17 @@ pub enum Commands {
         from: Option<String>,
         #[arg(long)]
         to: Option<String>,
+        /// Compare from the accepted baseline (see `gurgl accept`) to the latest
+        /// capture, instead of the latest two.
+        #[arg(long, conflicts_with_all = ["from", "to"])]
+        baseline: bool,
+        /// Exit 1 when new stable hosts were observed (for CI/cron gates).
+        /// `unknown` (default) triggers only on hosts needing scrutiny
+        /// (unknown / telemetry?); `any` triggers on any new stable host.
+        /// Exit codes: 0 = no drift at this threshold, 1 = drift, 2 = error.
+        #[arg(long, value_name = "LEVEL", num_args = 0..=1,
+              default_missing_value = "unknown", value_parser = ["unknown", "any"])]
+        check: Option<String>,
     },
 
     /// Emit an allowlist from a snapshot for an enforcement engine.
@@ -83,6 +99,11 @@ pub enum Commands {
         /// observation.
         #[arg(long = "until-closed")]
         until_closed: bool,
+        /// After each capture, diff it against the accepted baseline (or the
+        /// previous version) and print a drift summary. Exit 1 if any server
+        /// showed new stable hosts needing scrutiny - the one-shot cron audit.
+        #[arg(long = "diff")]
+        diff: bool,
     },
 
     /// Find MCP servers configured on this machine (Claude, Cursor, Windsurf, ...).
@@ -99,4 +120,32 @@ pub enum Commands {
     /// Walk through an annotated example diff using bundled snapshots. Needs no
     /// mitmproxy, sandbox, or Node - a 30-second tour of what gurgl shows you.
     Demo,
+
+    /// Record that you reviewed a host, so diff reports it quietly instead of
+    /// re-alerting. Acknowledged, not endorsed: gurgl never calls a host safe.
+    Ack {
+        server: String,
+        /// The host name to acknowledge (omit with --list).
+        host: Option<String>,
+        /// Why you consider this host expected (stored with the ack).
+        #[arg(long)]
+        note: Option<String>,
+        /// List this server's acknowledged hosts.
+        #[arg(long, conflicts_with = "remove")]
+        list: bool,
+        /// Remove the acknowledgement for HOST instead of adding one.
+        #[arg(long)]
+        remove: bool,
+    },
+
+    /// Mark a reviewed capture as this server's baseline; `diff --baseline` and
+    /// `watch --diff` then compare against it instead of the latest two.
+    Accept {
+        server: String,
+        /// Version to accept (default: the latest capture).
+        version: Option<String>,
+        /// Clear the baseline pointer instead of setting one.
+        #[arg(long)]
+        clear: bool,
+    },
 }

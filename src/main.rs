@@ -31,14 +31,28 @@ use crate::flightplan::FlightPlan;
 use crate::model::Reproducibility;
 use crate::store::Store;
 
-fn main() -> Result<()> {
+/// Exit-code contract (grep convention, so scripts can gate on drift):
+///   0 = success / no drift at the requested threshold
+///   1 = drift detected (`diff --check`, `watch --diff`)
+///   2 = error
+fn main() {
+    match run() {
+        Ok(code) => std::process::exit(code),
+        Err(e) => {
+            eprintln!("Error: {e:#}");
+            std::process::exit(2);
+        }
+    }
+}
+
+fn run() -> Result<i32> {
     let cli = Cli::parse();
 
     // `-u`/`--update` and `gurgl update` are the same explicit, user-invoked
     // update. Handle it before touching config/store (neither is needed) and
     // before anything else, so it works from a bare `gurgl -u`.
     if cli.update || matches!(cli.command, Some(Commands::Update)) {
-        return cmd_update();
+        return cmd_update().map(|_| 0);
     }
 
     let cfg = load_config(&cli)?;
@@ -47,24 +61,39 @@ fn main() -> Result<()> {
     match &cli.command {
         // Bare `gurgl`: a git-status-style orientation beats generic help. It
         // shows where this machine stands and the one next command that helps.
-        None => cmd_orient(&cfg, &store),
+        None => cmd_orient(&cfg, &store).map(|_| 0),
         Some(Commands::Update) => unreachable!("handled above"),
-        Some(Commands::Init) => cmd_init(&store),
-        Some(Commands::List) => cmd_list(&store),
-        Some(Commands::Show { server, version }) => cmd_show(&store, server, version.as_deref()),
-        Some(Commands::Diff { server, from, to }) => {
-            cmd_diff(&store, server, from.as_deref(), to.as_deref())
+        Some(Commands::Init) => cmd_init(&store).map(|_| 0),
+        Some(Commands::List) => cmd_list(&store, cli.json).map(|_| 0),
+        Some(Commands::Show { server, version }) => {
+            cmd_show(&store, server, version.as_deref(), cli.json).map(|_| 0)
         }
+        Some(Commands::Diff {
+            server,
+            from,
+            to,
+            baseline,
+            check,
+        }) => cmd_diff(
+            &store,
+            server,
+            from.as_deref(),
+            to.as_deref(),
+            *baseline,
+            check.as_deref(),
+            cli.json,
+        ),
         Some(Commands::Allow {
             server,
             version,
             format,
-        }) => cmd_allow(&store, server, version.as_deref(), format),
+        }) => cmd_allow(&store, server, version.as_deref(), format).map(|_| 0),
         Some(Commands::Watch {
             server,
             all,
             duration,
             until_closed,
+            diff,
         }) => cmd_watch(
             &cfg,
             &store,
@@ -73,9 +102,30 @@ fn main() -> Result<()> {
             cli.plain,
             duration.as_deref(),
             *until_closed,
+            *diff,
         ),
-        Some(Commands::Discover { import }) => cmd_discover(*import),
-        Some(Commands::Demo) => cmd_demo(),
+        Some(Commands::Discover { import }) => cmd_discover(*import, cli.json).map(|_| 0),
+        Some(Commands::Demo) => cmd_demo().map(|_| 0),
+        Some(Commands::Ack {
+            server,
+            host,
+            note,
+            list,
+            remove,
+        }) => cmd_ack(
+            &store,
+            server,
+            host.as_deref(),
+            note.as_deref(),
+            *list,
+            *remove,
+        )
+        .map(|_| 0),
+        Some(Commands::Accept {
+            server,
+            version,
+            clear,
+        }) => cmd_accept(&store, server, version.as_deref(), *clear).map(|_| 0),
     }
 }
 
@@ -308,25 +358,53 @@ fn cmd_init(store: &Store) -> Result<()> {
     Ok(())
 }
 
-fn cmd_list(store: &Store) -> Result<()> {
+fn cmd_list(store: &Store, json: bool) -> Result<()> {
     let servers = store.servers()?;
+    if json {
+        let mut entries = Vec::new();
+        for server in &servers {
+            entries.push(serde_json::json!({
+                "name": server,
+                "versions": store.versions(server)?,
+                "baseline": store.baseline(server),
+            }));
+        }
+        let out = serde_json::json!({ "schema": "gurgl.list/1", "servers": entries });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
     if servers.is_empty() {
         println!("no captures yet in {}", store.root().display());
         return Ok(());
     }
     for server in servers {
         let versions = store.versions(&server)?;
+        let baseline = store.baseline(&server);
         println!("{server}");
         for v in versions {
-            println!("  {v}");
+            let mark = if baseline.as_deref() == Some(v.as_str()) {
+                "  (baseline)"
+            } else {
+                ""
+            };
+            println!("  {v}{mark}");
         }
     }
     Ok(())
 }
 
-fn cmd_show(store: &Store, server: &str, version: Option<&str>) -> Result<()> {
+fn cmd_show(store: &Store, server: &str, version: Option<&str>, json: bool) -> Result<()> {
     let version = resolve_version(store, server, version)?;
     let snap = store.load(server, &version)?;
+    if json {
+        let out = serde_json::json!({
+            "schema": "gurgl.show/1",
+            "snapshot": snap,
+            "note": "presence only: hosts observed under this flight plan. Absence is non-coverage, not proof.",
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
     println!(
         "{}@{}  ({} trials, flight plan {})",
         snap.server, snap.version, snap.trials, snap.flightplan
@@ -397,69 +475,150 @@ fn class_legend(class: &str) -> &'static str {
     }
 }
 
-fn cmd_diff(store: &Store, server: &str, from: Option<&str>, to: Option<&str>) -> Result<()> {
-    let (from_v, to_v) = match (from, to) {
-        (Some(f), Some(t)) => (f.to_string(), t.to_string()),
-        _ => match store.latest_two(server)? {
-            Some(pair) => pair,
-            None => bail!(
-                "need at least two captured versions of '{server}' to diff (or pass --from/--to)"
-            ),
-        },
+/// The drift decision for `--check` and `watch --diff`, kept pure and testable:
+/// which new stable hosts trip the gate at each level, after acks are honored.
+fn drift_hosts<'a>(d: &'a diff::SnapshotDiff, level: &str, acked: &[String]) -> Vec<&'a str> {
+    d.stable_added()
+        .into_iter()
+        .filter(|h| level == "any" || h.class.needs_scrutiny())
+        .filter(|h| !acked.iter().any(|a| a == &h.name))
+        .map(|h| h.name.as_str())
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_diff(
+    store: &Store,
+    server: &str,
+    from: Option<&str>,
+    to: Option<&str>,
+    baseline: bool,
+    check: Option<&str>,
+    json: bool,
+) -> Result<i32> {
+    let (from_v, to_v) = if baseline {
+        // Compare what a human reviewed (gurgl accept) against the latest.
+        let base = store.baseline(server).with_context(|| {
+            format!("no baseline accepted for '{server}' - run `gurgl accept {server}` first")
+        })?;
+        let latest = store
+            .latest(server)?
+            .with_context(|| format!("no captures for '{server}'"))?;
+        (base, latest)
+    } else {
+        match (from, to) {
+            (Some(f), Some(t)) => (f.to_string(), t.to_string()),
+            _ => match store.latest_two(server)? {
+                Some(pair) => pair,
+                None => bail!(
+                    "need at least two captured versions of '{server}' to diff (or pass --from/--to)"
+                ),
+            },
+        }
     };
 
     let from_snap = store.load(server, &from_v)?;
     let to_snap = store.load(server, &to_v)?;
     let d = diff::diff(&from_snap, &to_snap);
+    let acks = store.acks(server)?;
+    let acked_names: Vec<String> = acks.iter().map(|a| a.host.clone()).collect();
 
-    println!("{}: {} -> {}", d.server, d.from_version, d.to_version);
-    println!("  unchanged hosts: {}", d.unchanged);
+    // Scrutiny-worthy additions, split by whether the user already reviewed them.
+    let scrutiny = d.stable_unknown_added();
+    let (acked_new, unacked): (Vec<&diff::HostDelta>, Vec<&diff::HostDelta>) = scrutiny
+        .into_iter()
+        .partition(|h| acked_names.iter().any(|a| a == &h.name));
 
-    if d.added.is_empty() {
-        println!("  no new hosts observed under this flight plan");
+    if json {
+        // Stable, versioned schema; the epistemic caveat travels in `note`.
+        let out = serde_json::json!({
+            "schema": "gurgl.diff/1",
+            "server": d.server,
+            "from_version": d.from_version,
+            "to_version": d.to_version,
+            "baseline_used": baseline,
+            "unchanged": d.unchanged,
+            "added": d.added,
+            "removed": d.removed,
+            "stable_added": d.stable_added().iter().map(|h| &h.name).collect::<Vec<_>>(),
+            "needs_scrutiny": unacked.iter().map(|h| &h.name).collect::<Vec<_>>(),
+            "acknowledged_present": acked_new.iter().map(|h| &h.name).collect::<Vec<_>>(),
+            "from_flightplan": from_snap.flightplan,
+            "to_flightplan": to_snap.flightplan,
+            "to_trials": to_snap.trials,
+            "note": "presence only: hosts observed under this flight plan. Absence is non-coverage, not proof.",
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
     } else {
-        println!("  new hosts:");
-        for delta in &d.added {
-            let flag = if delta.reproducibility == Reproducibility::Stable {
-                "" // stable: a real change
-            } else {
-                "  (intermittent - likely cohort noise, not a finding)"
-            };
-            println!("    + {:<40} [{}]{}", delta.name, delta.class, flag);
-        }
-        let unknown = d.stable_unknown_added();
-        if !unknown.is_empty() {
-            println!(
-                "\n  ⚠ {} new stable host(s) matched no known rule - review before trusting this update:",
-                unknown.len()
-            );
-            for u in &unknown {
-                println!("    {}  [{}]", u.name, u.class);
+        println!("{}: {} -> {}", d.server, d.from_version, d.to_version);
+        println!("  unchanged hosts: {}", d.unchanged);
+
+        if d.added.is_empty() {
+            println!("  no new hosts observed under this flight plan");
+        } else {
+            println!("  new hosts:");
+            for delta in &d.added {
+                let flag = if delta.reproducibility == Reproducibility::Stable {
+                    "" // stable: a real change
+                } else {
+                    "  (intermittent - likely cohort noise, not a finding)"
+                };
+                println!("    + {:<40} [{}]{}", delta.name, delta.class, flag);
             }
-            // Tell the user what to actually DO, not just that it happened.
-            println!(
-                "\n  next steps:\n    \
-                 1. confirm:  gurgl watch {}   (does it reproduce in a fresh capture?)\n    \
-                 2. inspect:  search the package source for the hostname (e.g. grep it in\n                 \
-                 the npm tarball or repo) to see what contacts it and why\n    \
-                 3. decide:   expected -> add it to `first_party` in gurgl.toml;\n                 \
-                 not expected -> stay on {} and investigate before upgrading",
-                d.server, d.from_version
-            );
+            if !unacked.is_empty() {
+                println!(
+                    "\n  ⚠ {} new stable host(s) matched no known rule - review before trusting this update:",
+                    unacked.len()
+                );
+                for u in &unacked {
+                    println!("    {}  [{}]", u.name, u.class);
+                }
+                // Tell the user what to actually DO, not just that it happened.
+                println!(
+                    "\n  next steps:\n    \
+                     1. confirm:  gurgl watch {}   (does it reproduce in a fresh capture?)\n    \
+                     2. inspect:  search the package source for the hostname (e.g. grep it in\n                 \
+                     the npm tarball or repo) to see what contacts it and why\n    \
+                     3. decide:   expected -> `gurgl ack {} <host> --note \"...\"` or add it to\n                 \
+                     `first_party`; not expected -> stay on {} and investigate",
+                    d.server, d.server, d.from_version
+                );
+            }
+            if !acked_new.is_empty() {
+                // Quiet by design: the user reviewed these (an ack is a recorded
+                // decision, not an endorsement).
+                println!(
+                    "\n  {} new host(s) you previously acknowledged (gurgl ack {} --list): {}",
+                    acked_new.len(),
+                    d.server,
+                    acked_new
+                        .iter()
+                        .map(|h| h.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
         }
+
+        if !d.removed.is_empty() {
+            println!("  hosts no longer observed:");
+            for delta in &d.removed {
+                println!("    - {:<40} [{}]", delta.name, delta.class);
+            }
+        }
+
+        println!(
+            "\nnote: presence only. Absence of a host is non-coverage under this flight plan, not proof the tool won't contact it."
+        );
     }
 
-    if !d.removed.is_empty() {
-        println!("  hosts no longer observed:");
-        for delta in &d.removed {
-            println!("    - {:<40} [{}]", delta.name, delta.class);
+    // --check: exit 1 on drift at the requested threshold (acks honored).
+    if let Some(level) = check {
+        if !drift_hosts(&d, level, &acked_names).is_empty() {
+            return Ok(1);
         }
     }
-
-    println!(
-        "\nnote: presence only. Absence of a host is non-coverage under this flight plan, not proof the tool won't contact it."
-    );
-    Ok(())
+    Ok(0)
 }
 
 fn cmd_allow(store: &Store, server: &str, version: Option<&str>, format: &str) -> Result<()> {
@@ -470,6 +629,7 @@ fn cmd_allow(store: &Store, server: &str, version: Option<&str>, format: &str) -
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_watch(
     cfg: &Config,
     store: &Store,
@@ -478,7 +638,8 @@ fn cmd_watch(
     plain: bool,
     duration: Option<&str>,
     until_closed: bool,
-) -> Result<()> {
+    audit: bool,
+) -> Result<i32> {
     // A named server watches just that one; bare `gurgl watch` (like `--all`)
     // watches every server configured in gurgl.toml.
     let targets: Vec<&config::ServerSpec> = match server {
@@ -524,12 +685,24 @@ fn cmd_watch(
     let multi = targets.len() > 1;
     let mut captured = 0usize;
     let mut skipped: Vec<String> = Vec::new();
+    // --diff: per-server drift lines, printed after the batch summary.
+    let mut drift_lines: Vec<String> = Vec::new();
+    let mut drifted = false;
     for spec in targets {
         if observe::stop_requested() {
             println!("stopped by user; skipping remaining servers");
             break;
         }
         let plan_path = cfg.flightplan_path_for(spec);
+        // For --diff: what we will compare the fresh capture against - the
+        // accepted baseline if set, else whatever is latest BEFORE this save.
+        let compare_to = if audit {
+            store
+                .baseline(&spec.name)
+                .or(store.latest(&spec.name).unwrap_or(None))
+        } else {
+            None
+        };
         match FlightPlan::load(&plan_path)
             .with_context(|| format!("loading flight plan {}", plan_path.display()))
             .and_then(|plan| observe::capture(cfg, spec, &plan, mode, monitor))
@@ -562,6 +735,49 @@ fn cmd_watch(
                     }
                 }
                 captured += 1;
+
+                // The audit line for this server, against baseline/previous.
+                if audit {
+                    match compare_to {
+                        Some(prev) if prev != snap.version => {
+                            let prev_snap = store.load(&snap.server, &prev)?;
+                            let d = diff::diff(&prev_snap, &snap);
+                            let acked: Vec<String> = store
+                                .acks(&snap.server)?
+                                .into_iter()
+                                .map(|a| a.host)
+                                .collect();
+                            let scrutiny = drift_hosts(&d, "unknown", &acked);
+                            let stable_new = d.stable_added().len();
+                            if scrutiny.is_empty() {
+                                drift_lines.push(format!(
+                                    "  {:<16} {} -> {}: {} new stable host(s), none needing scrutiny",
+                                    snap.server, prev, snap.version, stable_new
+                                ));
+                            } else {
+                                drifted = true;
+                                drift_lines.push(format!(
+                                    "  {:<16} {} -> {}: {} new stable host(s) NEED SCRUTINY: {} \
+                                     (gurgl diff {})",
+                                    snap.server,
+                                    prev,
+                                    snap.version,
+                                    scrutiny.len(),
+                                    scrutiny.join(", "),
+                                    snap.server
+                                ));
+                            }
+                        }
+                        Some(_) => drift_lines.push(format!(
+                            "  {:<16} same version label - nothing to compare",
+                            snap.server
+                        )),
+                        None => drift_lines.push(format!(
+                            "  {:<16} first capture - baseline recorded, nothing to compare yet",
+                            snap.server
+                        )),
+                    }
+                }
             }
             Err(e) => {
                 // A deliberate stop is not a per-server failure; the loop's next
@@ -586,11 +802,132 @@ fn cmd_watch(
         // A deliberate quit before anything completed is not an error.
         if observe::stop_requested() {
             println!("stopped by user; nothing captured");
-            return Ok(());
+            return Ok(0);
         }
         bail!("no servers were captured (see the messages above)");
     }
+
+    if audit && !drift_lines.is_empty() {
+        println!("\ndrift (vs accepted baseline, else previous version; acks honored):");
+        for line in &drift_lines {
+            println!("{line}");
+        }
+        if drifted {
+            println!(
+                "\nnew stable hosts needing scrutiny were observed - exit 1. Review with \
+                 `gurgl diff <server>`."
+            );
+            return Ok(1);
+        }
+        println!("\nno drift needing scrutiny - exit 0.");
+    }
+    Ok(0)
+}
+
+/// Record, list, or remove host acknowledgements. Wording is deliberate
+/// throughout: an ack is "you reviewed this and said why", never approval.
+fn cmd_ack(
+    store: &Store,
+    server: &str,
+    host: Option<&str>,
+    note: Option<&str>,
+    list: bool,
+    remove: bool,
+) -> Result<()> {
+    if list {
+        let acks = store.acks(server)?;
+        if acks.is_empty() {
+            println!("no acknowledged hosts for {server}.");
+            return Ok(());
+        }
+        println!("acknowledged hosts for {server} (reviewed, not endorsed):");
+        for a in acks {
+            let at = a
+                .reviewed_at_version
+                .map(|v| format!(" @{v}"))
+                .unwrap_or_default();
+            let note = a.note.map(|n| format!("  - {n}")).unwrap_or_default();
+            println!("  {:<40} {}{}{}", a.host, a.date, at, note);
+        }
+        return Ok(());
+    }
+
+    let host = host.context("specify a host to ack (or use --list)")?;
+    if remove {
+        if store.remove_ack(server, host)? {
+            println!("removed the acknowledgement for {host}; diff will alert on it again.");
+        } else {
+            println!("no acknowledgement recorded for {host}.");
+        }
+        return Ok(());
+    }
+
+    let ack = store::Ack {
+        host: host.to_string(),
+        note: note.map(String::from),
+        date: today(),
+        reviewed_at_version: store.latest(server)?,
+    };
+    let replaced = store.add_ack(server, ack)?;
+    println!(
+        "{} {host} for {server}. diff now reports it quietly instead of alerting;\n\
+         undo with `gurgl ack {server} {host} --remove`. An ack records your review -\n\
+         gurgl still cannot see what is SENT to this host (payloads are out of scope).",
+        if replaced {
+            "updated the acknowledgement of"
+        } else {
+            "acknowledged"
+        }
+    );
     Ok(())
+}
+
+/// Set or clear the reviewed-baseline pointer used by `diff --baseline` and
+/// `watch --diff`.
+fn cmd_accept(store: &Store, server: &str, version: Option<&str>, clear: bool) -> Result<()> {
+    if clear {
+        store.set_baseline(server, None)?;
+        println!("cleared the baseline for {server}; diff defaults to the latest two versions.");
+        return Ok(());
+    }
+    let version = match version {
+        Some(v) => {
+            if !store.exists(server, v) {
+                bail!("no capture stored for {server}@{v} (see `gurgl list`)");
+            }
+            v.to_string()
+        }
+        None => store
+            .latest(server)?
+            .with_context(|| format!("no captures for '{server}' - run `gurgl watch {server}`"))?,
+    };
+    store.set_baseline(server, Some(&version))?;
+    println!(
+        "accepted {server}@{version} as the reviewed baseline. `gurgl diff {server} --baseline`\n\
+         and `gurgl watch --diff` now compare against it. This records that you reviewed this\n\
+         capture - it is not a statement that the server is safe."
+    );
+    Ok(())
+}
+
+/// Today as YYYY-MM-DD (UTC), from the system clock - no date dependency.
+/// Civil-from-days algorithm (Howard Hinnant's); valid for the unix era.
+fn today() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let z = (secs / 86_400) as i64 + 719_468;
+    let era = z / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
 }
 
 /// Parse a `--for` duration like `30s`, `5m`, `1h` (a bare number is seconds).
@@ -615,8 +952,17 @@ fn parse_hold(s: &str) -> Result<std::time::Duration> {
     Ok(std::time::Duration::from_secs(n * mult))
 }
 
-fn cmd_discover(import: bool) -> Result<()> {
+fn cmd_discover(import: bool, json: bool) -> Result<()> {
     let found = discover::discover();
+    if json {
+        // Inventory as data; --import still requires the human-readable mode.
+        let out = serde_json::json!({ "schema": "gurgl.discover/1", "servers": found });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        if import {
+            bail!("--import is interactive-output only; run it without --json");
+        }
+        return Ok(());
+    }
     if found.is_empty() {
         println!(
             "no MCP servers found. gurgl looked in the standard client configs\n\
@@ -796,24 +1142,28 @@ fn cmd_update() -> Result<()> {
 
     if src.join(".git").is_dir() {
         println!(">> updating gurgl source in {} ...", src.display());
-        run(Command::new("git")
-            .arg("-C")
-            .arg(&src)
-            .args(["pull", "--ff-only"]))?;
+        run_cmd(
+            Command::new("git")
+                .arg("-C")
+                .arg(&src)
+                .args(["pull", "--ff-only"]),
+        )?;
     } else {
         std::fs::create_dir_all(&home).with_context(|| format!("creating {}", home.display()))?;
         if src.exists() {
             std::fs::remove_dir_all(&src).with_context(|| format!("clearing {}", src.display()))?;
         }
         println!(">> fetching gurgl from {REPO} ...");
-        run(Command::new("git").arg("clone").arg(REPO).arg(&src))?;
+        run_cmd(Command::new("git").arg("clone").arg(REPO).arg(&src))?;
     }
 
     println!(">> building + installing the update ...");
-    run(Command::new("bash")
-        .arg(src.join("install.sh"))
-        .arg("--no-modify-path")
-        .current_dir(&src))?;
+    run_cmd(
+        Command::new("bash")
+            .arg(src.join("install.sh"))
+            .arg("--no-modify-path")
+            .current_dir(&src),
+    )?;
 
     println!("\ngurgl is up to date. Check `gurgl --version`.");
     Ok(())
@@ -821,7 +1171,7 @@ fn cmd_update() -> Result<()> {
 
 /// Run a subprocess inheriting stdio, with clear errors when the tool is missing
 /// or the command fails.
-fn run(cmd: &mut std::process::Command) -> Result<()> {
+fn run_cmd(cmd: &mut std::process::Command) -> Result<()> {
     let program = cmd.get_program().to_string_lossy().to_string();
     let status = cmd.status().map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
@@ -862,5 +1212,93 @@ fn repro_str(r: Reproducibility) -> &'static str {
     match r {
         Reproducibility::Stable => "stable",
         Reproducibility::Intermittent => "intermittent",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Host, HostClass, Snapshot};
+
+    fn snap(version: &str, hosts: Vec<Host>) -> Snapshot {
+        Snapshot {
+            server: "s".into(),
+            version: version.into(),
+            captured_at: 0,
+            trials: 5,
+            flightplan: "fp".into(),
+            gurgl_version: "0".into(),
+            hosts,
+        }
+    }
+
+    fn host(name: &str, class: HostClass, repro: Reproducibility) -> Host {
+        Host {
+            name: name.into(),
+            class,
+            reproducibility: repro,
+            seen_in_trials: if repro == Reproducibility::Stable {
+                5
+            } else {
+                2
+            },
+            phases: vec![],
+        }
+    }
+
+    #[test]
+    fn drift_gate_levels_and_acks() {
+        let from = snap("1.0", vec![]);
+        let to = snap(
+            "1.1",
+            vec![
+                host(
+                    "api.vendor.example",
+                    HostClass::FirstParty,
+                    Reproducibility::Stable,
+                ),
+                host(
+                    "beacon.evil.example",
+                    HostClass::Unknown,
+                    Reproducibility::Stable,
+                ),
+                host(
+                    "telemetry.odd.example",
+                    HostClass::TelemetryNamed,
+                    Reproducibility::Stable,
+                ),
+                host(
+                    "flaky.example",
+                    HostClass::Unknown,
+                    Reproducibility::Intermittent,
+                ),
+            ],
+        );
+        let d = diff::diff(&from, &to);
+
+        // Default level: only stable scrutiny classes trip the gate; the
+        // intermittent unknown never does (the reproduction gate holds).
+        let hits = drift_hosts(&d, "unknown", &[]);
+        assert_eq!(hits, vec!["beacon.evil.example", "telemetry.odd.example"]);
+
+        // `any`: every stable addition trips it, including first-party.
+        assert_eq!(drift_hosts(&d, "any", &[]).len(), 3);
+
+        // Acks silence exactly the reviewed host, at both levels.
+        let acked = vec!["beacon.evil.example".to_string()];
+        assert_eq!(
+            drift_hosts(&d, "unknown", &acked),
+            vec!["telemetry.odd.example"]
+        );
+        assert_eq!(drift_hosts(&d, "any", &acked).len(), 2);
+    }
+
+    #[test]
+    fn today_is_iso_date_shaped() {
+        let t = today();
+        assert_eq!(t.len(), 10);
+        assert_eq!(t.as_bytes()[4], b'-');
+        assert_eq!(t.as_bytes()[7], b'-');
+        assert!(t.starts_with("20"));
     }
 }

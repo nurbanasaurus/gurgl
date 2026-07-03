@@ -29,7 +29,8 @@ use serde_json::Value;
 /// Whether a discovered server is actually turned on in its client, or merely
 /// present on disk. Determined from the client's own enable records; when we
 /// cannot find a positive "on" record we never claim `Enabled`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Status {
     /// Positively listed as enabled in the client config (authoritative).
     Enabled,
@@ -52,7 +53,7 @@ impl std::fmt::Display for Status {
 }
 
 /// One MCP server found in a client config.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Discovered {
     pub name: String,
     /// stdio launch command, if this is a local (subprocess) server.

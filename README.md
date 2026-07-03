@@ -294,14 +294,23 @@ Working from a source clone instead? `make update` (git pull + reinstall) and
 | `gurgl discover [--import]` | Find MCP servers on this machine (with enabled/bundled status); `--import` adds the stdio ones to `gurgl.toml`. |
 | `gurgl list` | List captured servers and versions. |
 | `gurgl show <server> [version]` | Show observed hosts for a version (default: latest). |
-| `gurgl watch [<server>] [--all] [--for <dur>] [--until-closed]` | Capture egress behind the proxy (needs mitmproxy + sandbox). `--for`/`--until-closed` watch over time. |
-| `gurgl diff <server> [--from --to]` | Diff egress between two versions (default: latest two). |
+| `gurgl watch [<server>] [--all] [--for <dur>] [--until-closed] [--diff]` | Capture egress behind the proxy (needs mitmproxy + sandbox). `--diff` audits each capture against its baseline and exits 1 on drift. |
+| `gurgl diff <server> [--from --to] [--baseline] [--check[=any]]` | Diff egress between versions. `--check` exits 1 on new stable scrutiny hosts (CI/cron gates). |
+| `gurgl ack <server> <host> [--note ...]` | Record that you reviewed a host so diff reports it quietly (also `--list`, `--remove`). |
+| `gurgl accept <server> [version]` | Mark a reviewed capture as the baseline for `--baseline` / `watch --diff`. |
 | `gurgl allow <server> [--format ...]` | Emit an allowlist (`sandbox-runtime` / `opensnitch` / `squid`). |
 | `gurgl update` (`-u`, `--update`) | Pull the latest source and reinstall. Runs only when invoked; no auto-update. |
 
 Global flags: `--config <path>` (else `./gurgl.toml`, else `~/.gurgl/gurgl.toml`),
-`--store <dir>`, `--plain` (disable the live dashboard). Every flag, the config
-schema, and flight plans are documented in **[docs/USAGE.md](docs/USAGE.md)**.
+`--store <dir>`, `--plain` (disable the live dashboard), `--json` (stable,
+versioned JSON from `list`/`show`/`diff`/`discover`, for jq and scripts).
+
+**Exit codes** are a contract: `0` = no drift at the requested threshold, `1` =
+drift detected (`diff --check`, `watch --diff`), `2` = error - so a cron line or
+CI step can gate on gurgl directly. Copy-paste automation (cron, systemd,
+launchd, CI, jq) lives in **[docs/RECIPES.md](docs/RECIPES.md)**. Every flag,
+the config schema, and flight plans are documented in
+**[docs/USAGE.md](docs/USAGE.md)**.
 
 ## Using gurgl effectively
 
@@ -315,17 +324,19 @@ filesystem tool that talks to one host is boring - that is the point. A
 "markdown converter" contacting six unknowns is a decision you now get to make
 consciously.
 
-**2. Gate upgrades with diff.** The core loop. Baseline every server you use,
-then after any update:
+**2. Gate upgrades with diff.** The core loop. Baseline every server you use
+(`gurgl accept <server>` once reviewed), then after any update:
 
 ```sh
-gurgl watch --all && gurgl diff <server>
+gurgl watch --all --diff        # captures, compares to your baselines, exits 1 on drift
 ```
 
 A new **stable** unknown host after a version bump is exactly the
 [postmark-mcp] pattern - a package that turns malicious in a patch release. This
-is the one attack class an egress diff catches almost for free. A weekly cron of
-`watch --all` plus diff, output to a log, is the highest value-per-effort setup.
+is the one attack class an egress diff catches almost for free. Put that one
+command in a weekly cron ([docs/RECIPES.md](docs/RECIPES.md)) and review with
+`gurgl diff <server>` when it exits 1; `gurgl ack` hosts you have reviewed so
+they never re-alert, and `gurgl accept` the capture when you are done.
 
 **3. Commit your snapshots.** They are plain JSON receipts in
 `~/.gurgl/snapshots/`. Keep them in a git repo and you have a timestamped,
@@ -366,6 +377,7 @@ sandbox is **functional but not yet a security boundary**. See
 |-----|------|
 | [docs/INSTALL.md](docs/INSTALL.md) | Per-OS install, PATH, remote deploy, uninstall |
 | [docs/USAGE.md](docs/USAGE.md) | Every command + the config & flight-plan reference |
+| [docs/RECIPES.md](docs/RECIPES.md) | Cron/systemd/launchd audits, CI gates, jq one-liners |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | How capture, the reproduction gate, and storage work |
 | [docs/THREAT-MODEL.md](docs/THREAT-MODEL.md) | What gurgl can and cannot see - read before trusting output |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | Scope, kill criteria, the deliberate ceiling |

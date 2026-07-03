@@ -210,6 +210,21 @@ and scripts are unaffected; force plain anywhere with `--plain`. It adds no
 dependencies (plain ANSI on the alternate screen) and restores your terminal when
 it finishes.
 
+The dashboard is interactive. Move the selection through the host list and open
+any host for rich context: what its class means, every phase it appeared in, how
+many trials have seen it so far, and when it first showed up.
+
+| Key | Action |
+|-----|--------|
+| `up`/`down` or `k`/`j` | Move the host selection |
+| `enter` (or `1`-`9` to jump) | Open the selected host's detail view |
+| `esc` (or `h`/`0`) | Back to the overview |
+| `q` | Stop cleanly and save what completed (same as Ctrl-C) |
+
+`q` and Ctrl-C both stop gracefully in every mode: a partial battery trial is
+discarded (the reproduction gate only compares complete runs), completed trials
+are saved, and the terminal is restored. Press Ctrl-C twice to force-quit.
+
 ### Watching over time
 
 By default `gurgl watch` runs the repeated-trial battery and exits. To sit and

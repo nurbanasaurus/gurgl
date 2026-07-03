@@ -170,6 +170,20 @@ dashboard: a trial progress bar, per-phase timers, and hosts streaming in colore
 by class. It draws on the alternate screen and restores your terminal on exit, so
 scrollback is untouched; the final snapshot summary is left in place afterward.
 
+**Interactive drill-down.** The dashboard takes single keypresses (when stdin is
+a terminal): `up`/`down` or `j`/`k` move the host selection, `enter` opens the
+selected host (or press `1`-`9` to jump straight to a row), `esc` backs out, and
+`q` stops cleanly and saves. The detail view shows the host's class with a
+one-line explanation, every phase it appeared in, which trials have seen it so
+far, and when it first appeared; inside it, `up`/`down` step through the other
+hosts. A footer menu lists the keys at all times.
+
+**Stopping.** `q` and Ctrl-C both request a clean stop in every mode: the current
+partial battery trial is discarded (the reproduction gate only compares complete
+runs of the plan), completed trials are aggregated and saved with the completed
+count, and the terminal is restored. In `--for`/`--until-closed` mode the single
+observation is saved as-is. A second Ctrl-C force-quits immediately.
+
 **Watching over time.** By default `watch` runs the `trials` battery and exits.
 Two flags turn it into a live monitor instead - one long observation (the flight
 plan once, then a monitoring hold), so you can watch what a server beacons at rest:

@@ -77,8 +77,12 @@ Path helpers live in `config.rs` (`gurgl_home()`, `default_config_path()`,
   live pipeline (spawn proxy, launch sandboxed server, drive MCP over stdio,
   attribute hosts to phases by timestamp). Implemented and verified. `Monitor`
   controls run length: `Battery` (default, N trials) or `Hold(Option<Duration>)`
-  for `watch --for`/`--until-closed` (one long observation; Ctrl-C via a SIGINT
-  handler in the `interrupt` submodule, unix-only, using `libc`).
+  for `watch --for`/`--until-closed` (one long observation). Graceful stop: the
+  `interrupt` submodule's SIGINT handler (armed for every watch; double Ctrl-C
+  force-quits) plus `request_stop()`/`stop_requested()` checked at step
+  boundaries, sleep/monitor ticks, and in 250ms `read_response` slices. A
+  battery trial cut short is discarded (the gate compares complete runs);
+  `Snapshot.trials` is the completed count.
 - `diff.rs` - pure `diff(from, to) -> SnapshotDiff`.
 - `emit.rs` - `allowlist(snapshot, Format)` for sandbox-runtime / opensnitch / squid.
 - `store.rs` - JSON snapshots at `<store>/<server>/<version>.json`.
@@ -92,7 +96,10 @@ Path helpers live in `config.rs` (`gurgl_home()`, `default_config_path()`,
   client configs; never reads `env` values.
 - `mcp.rs` - minimal MCP JSON-RPC message builders.
 - `report.rs` - `Reporter` trait + `PlainReporter` (piped/`--plain`) and
-  `DashboardReporter` (live ANSI dashboard, no deps, TTY-gated). `watch` only.
+  `DashboardReporter` (live ANSI dashboard, no deps, TTY-gated). Interactive:
+  raw termios stdin (unix, `rawin` module) + an input thread; j/k/arrows select
+  a host, enter/1-9 open a rich detail view, esc backs out, q requests the same
+  clean stop as Ctrl-C (`observe::request_stop`). `watch` only.
 
 ## Conventions
 

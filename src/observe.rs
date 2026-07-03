@@ -34,19 +34,35 @@ pub enum Monitor {
     Hold(Option<Duration>),
 }
 
-/// Process-wide "user asked us to stop" flag, set by a SIGINT handler so a
-/// `Hold(None)` monitor can break its loop, tear down, and still save. Without
-/// this, Ctrl-C would kill us mid-capture and leave the dashboard's alternate
-/// screen up (Drop does not run on an uncaught signal).
+/// Process-wide "user asked us to stop" flag, set by a SIGINT handler (or the
+/// dashboard's `q` key) so a running watch can break its loop, tear down, and
+/// still save. Without this, Ctrl-C would kill us mid-capture and leave the
+/// dashboard's alternate screen (and raw keyboard mode) active - Drop does not
+/// run on an uncaught signal. A second Ctrl-C restores the default handler and
+/// re-raises, as a hard-exit escape hatch if teardown ever wedges.
 #[cfg(unix)]
 mod interrupt {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     static STOP: AtomicBool = AtomicBool::new(false);
+    /// SIGINTs received, counted separately from STOP: the dashboard's `q` also
+    /// sets STOP, and must NOT make the next (first) Ctrl-C look like a second
+    /// one and take the hard-exit path below.
+    static SIGINTS: AtomicU32 = AtomicU32::new(0);
 
     extern "C" fn on_signal(_sig: libc::c_int) {
-        // Storing to an atomic is async-signal-safe.
+        // Only async-signal-safe operations here: atomics, write(), tcsetattr(),
+        // signal(), raise().
         STOP.store(true, Ordering::SeqCst);
+        if SIGINTS.fetch_add(1, Ordering::SeqCst) >= 1 {
+            // Second Ctrl-C: force quit. Best-effort terminal restore first so
+            // the shell is not left on the alternate screen in raw mode.
+            crate::report::emergency_restore();
+            unsafe {
+                libc::signal(libc::SIGINT, libc::SIG_DFL);
+                libc::raise(libc::SIGINT);
+            }
+        }
     }
 
     /// Install the SIGINT handler (idempotent enough to call once per watch).
@@ -56,21 +72,40 @@ mod interrupt {
         }
     }
 
+    pub fn request() {
+        STOP.store(true, Ordering::SeqCst);
+    }
+
     pub fn requested() -> bool {
         STOP.load(Ordering::SeqCst)
     }
 }
 #[cfg(not(unix))]
 mod interrupt {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static STOP: AtomicBool = AtomicBool::new(false);
     pub fn install() {}
+    pub fn request() {
+        STOP.store(true, Ordering::SeqCst);
+    }
     pub fn requested() -> bool {
-        false
+        STOP.load(Ordering::SeqCst)
     }
 }
 
 /// Arrange for Ctrl-C to request a clean stop rather than kill the process.
 pub fn arm_interrupt() {
     interrupt::install();
+}
+
+/// Request a clean stop, exactly as Ctrl-C would (used by the dashboard's `q`).
+pub fn request_stop() {
+    interrupt::request();
+}
+
+/// Whether a clean stop has been requested.
+pub fn stop_requested() -> bool {
+    interrupt::requested()
 }
 
 /// Aggregate per-trial host observations into final hosts, applying the
@@ -168,17 +203,36 @@ pub fn capture(
     let mut trials: Vec<Vec<FlowHost>> = Vec::with_capacity(trial_count as usize);
     let mut reported_version: Option<String> = None;
     for i in 1..=trial_count {
+        if stop_requested() {
+            break;
+        }
         reporter.trial_start(i, trial_count);
-        let (hosts, ver) = run_trial(cfg, spec, plan, i, monitor, reporter.as_mut())
+        let trial = run_trial(cfg, spec, plan, i, monitor, reporter.as_mut())
             .with_context(|| format!("trial {i} of {}", spec.name))?;
         if reported_version.is_none() {
-            reported_version = ver;
+            reported_version = trial.server_version;
         }
-        let uniq: std::collections::BTreeSet<&String> = hosts.iter().map(|h| &h.host).collect();
+        // A trial cut short by a stop request is discarded in battery mode: the
+        // reproduction gate compares complete runs of the same plan, and a
+        // partial run would mark every host it missed as intermittent. A Hold
+        // observation is one long session by definition, so it always counts.
+        // (run_trial already surfaced the note.)
+        if !trial.completed && matches!(monitor, Monitor::Battery) {
+            break;
+        }
+        let uniq: std::collections::BTreeSet<&String> =
+            trial.hosts.iter().map(|h| &h.host).collect();
         reporter.trial_end(i, uniq.len());
-        trials.push(hosts);
+        trials.push(trial.hosts);
     }
 
+    if trials.is_empty() {
+        bail!(
+            "stopped before any complete trial of {} - nothing captured",
+            spec.name
+        );
+    }
+    let completed_trials = trials.len() as u32;
     let hosts = aggregate(&trials, &spec.first_party);
     let captured_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -201,7 +255,7 @@ pub fn capture(
         server: spec.name.clone(),
         version,
         captured_at,
-        trials: trial_count,
+        trials: completed_trials,
         flightplan: plan.fingerprint(),
         gurgl_version: env!("CARGO_PKG_VERSION").to_string(),
         hosts,
@@ -220,9 +274,17 @@ impl Drop for KillOnDrop {
     }
 }
 
+/// One trial's outcome.
+struct Trial {
+    hosts: Vec<FlowHost>,
+    /// The server's self-reported version (from `initialize`), if any.
+    server_version: Option<String>,
+    /// False when a stop request cut the flight plan short mid-steps.
+    completed: bool,
+}
+
 /// Run one trial: start the proxy, launch the sandboxed server through it, drive
-/// the flight plan over stdio, then read back the observed hosts. Returns the
-/// hosts and the server's self-reported version (from `initialize`), if any.
+/// the flight plan over stdio, then read back the observed hosts.
 fn run_trial(
     cfg: &Config,
     spec: &ServerSpec,
@@ -230,7 +292,7 @@ fn run_trial(
     trial: u32,
     monitor: Monitor,
     reporter: &mut dyn Reporter,
-) -> Result<(Vec<FlowHost>, Option<String>)> {
+) -> Result<Trial> {
     // Per-trial scratch (its own flow file + addon copy).
     let tmp = std::env::temp_dir().join(format!(
         "gurgl-{}-{}-{}",
@@ -316,6 +378,13 @@ fn run_trial(
     let mut surfaced: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
     for step in &plan.steps {
+        // A stop request (Ctrl-C, or `q` in the dashboard) ends the plan at the
+        // next step boundary; the sleep/monitor loops below also check per tick.
+        // Note here (not in capture()): the trial teardown below leaves time for
+        // the dashboard to actually paint it before the screen is restored.
+        if stop_requested() {
+            break;
+        }
         phase_marks.push((now_epoch(), step.phase.clone()));
         reporter.phase(&step.phase);
         match step.action.as_str() {
@@ -351,7 +420,7 @@ fn run_trial(
             // Poll during the idle sleep too, so late beacons stream in live.
             "sleep" => {
                 let end = Instant::now() + Duration::from_secs(step.seconds.unwrap_or(5));
-                while Instant::now() < end {
+                while Instant::now() < end && !stop_requested() {
                     thread::sleep(Duration::from_millis(200));
                     surface_hosts(
                         &flows_path,
@@ -373,6 +442,21 @@ fn run_trial(
         );
     }
 
+    // The trial is complete only if no stop arrived while the plan ran: a stop
+    // can cut ANY step short (sleep breaks per tick, responses return early),
+    // including the last one, so "reached the end of the loop" is not enough.
+    // Evaluated before the Hold below, where a stop is the normal way out.
+    let completed = !stop_requested();
+    if !completed {
+        // The trial teardown below sleeps long enough for the dashboard's
+        // render thread to actually paint this before the screen is restored.
+        if matches!(monitor, Monitor::Battery) {
+            reporter.note("stopping; discarding the partial trial");
+        } else {
+            reporter.note("stopping; saving what was captured");
+        }
+    }
+
     // --- optional live monitoring hold (watch --for / --until-closed) ---
     // After the scripted plan, keep the server up and stream egress for a fixed
     // time or until Ctrl-C, so you can watch what it beacons at rest.
@@ -382,8 +466,8 @@ fn run_trial(
         reporter.phase(phase);
         let start = Instant::now();
         loop {
-            if interrupt::requested() {
-                reporter.note("stopping (Ctrl-C); saving what was captured");
+            if stop_requested() {
+                reporter.note("stopping; saving what was captured");
                 break;
             }
             if let Some(d) = dur {
@@ -418,7 +502,11 @@ fn run_trial(
     let raw = proxy::parse_flows(&flows_path)?;
     let hosts = attribute_phases(raw, &phase_marks);
     let _ = std::fs::remove_dir_all(&tmp);
-    Ok((hosts, server_version))
+    Ok(Trial {
+        hosts,
+        server_version,
+        completed,
+    })
 }
 
 /// Make a server-reported version safe to use as a snapshot filename, keeping
@@ -546,20 +634,35 @@ fn spawn_line_reader(stdout: std::process::ChildStdout) -> Receiver<String> {
     rx
 }
 
-/// Drain lines until one parses to a JSON-RPC object with the given id.
+/// Drain lines until one parses to a JSON-RPC object with the given id. Waits in
+/// short slices so a stop request (Ctrl-C / `q`) interrupts a slow server
+/// instead of blocking the full timeout.
 fn read_response(rx: &Receiver<String>, id: u64, timeout: Duration) -> Option<Value> {
+    let matches = |line: &str| -> Option<Value> {
+        let v = serde_json::from_str::<Value>(line.trim()).ok()?;
+        (v.get("id").and_then(|i| i.as_u64()) == Some(id)).then_some(v)
+    };
     let deadline = Instant::now() + timeout;
     loop {
+        // Consume whatever already arrived before honoring a stop, so a response
+        // that IS here (e.g. initialize's serverInfo) isn't thrown away.
+        while let Ok(line) = rx.try_recv() {
+            if let Some(v) = matches(&line) {
+                return Some(v);
+            }
+        }
+        if stop_requested() {
+            return None;
+        }
         let remaining = deadline.checked_duration_since(Instant::now())?;
-        match rx.recv_timeout(remaining) {
+        match rx.recv_timeout(remaining.min(Duration::from_millis(250))) {
             Ok(line) => {
-                if let Ok(v) = serde_json::from_str::<Value>(line.trim()) {
-                    if v.get("id").and_then(|i| i.as_u64()) == Some(id) {
-                        return Some(v);
-                    }
+                if let Some(v) = matches(&line) {
+                    return Some(v);
                 }
             }
-            Err(_) => return None,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return None,
         }
     }
 }
@@ -576,6 +679,11 @@ fn wait_for_port(port: u16, timeout: Duration) -> Result<()> {
         if TcpStream::connect(("127.0.0.1", port)).is_ok() {
             return Ok(());
         }
+        // Honor Ctrl-C/q during proxy startup too; otherwise a wedged mitmdump
+        // makes the watch unresponsive for the full timeout.
+        if stop_requested() {
+            bail!("stopped by user");
+        }
         thread::sleep(Duration::from_millis(150));
     }
     bail!("nothing listening on 127.0.0.1:{port} after {timeout:?}")
@@ -586,6 +694,9 @@ fn wait_for_file(path: &Path, timeout: Duration) -> Result<()> {
     while Instant::now() < deadline {
         if path.exists() {
             return Ok(());
+        }
+        if stop_requested() {
+            bail!("stopped by user");
         }
         thread::sleep(Duration::from_millis(150));
     }

@@ -281,10 +281,9 @@ fn cmd_watch(
     } else {
         observe::Monitor::Battery
     };
-    // For a long/indefinite watch, make Ctrl-C a clean stop that still saves.
-    if matches!(monitor, observe::Monitor::Hold(_)) {
-        observe::arm_interrupt();
-    }
+    // Make Ctrl-C (and the dashboard's `q`) a clean stop that still saves what
+    // completed, in every watch mode. A second Ctrl-C force-quits.
+    observe::arm_interrupt();
 
     // Live dashboard when attached to a terminal; plain lines when piped or with
     // --plain, so logs and scripts are unaffected.
@@ -301,6 +300,10 @@ fn cmd_watch(
     let mut captured = 0usize;
     let mut skipped: Vec<String> = Vec::new();
     for spec in targets {
+        if observe::stop_requested() {
+            println!("stopped by user; skipping remaining servers");
+            break;
+        }
         let plan_path = cfg.flightplan_path_for(spec);
         match FlightPlan::load(&plan_path)
             .with_context(|| format!("loading flight plan {}", plan_path.display()))
@@ -319,6 +322,11 @@ fn cmd_watch(
                 captured += 1;
             }
             Err(e) => {
+                // A deliberate stop is not a per-server failure; the loop's next
+                // iteration (or the captured==0 path) reports it neutrally.
+                if observe::stop_requested() {
+                    continue;
+                }
                 eprintln!("skipped {}: {:#}", spec.name, e);
                 skipped.push(spec.name.clone());
             }
@@ -333,6 +341,11 @@ fn cmd_watch(
         println!();
     }
     if captured == 0 {
+        // A deliberate quit before anything completed is not an error.
+        if observe::stop_requested() {
+            println!("stopped by user; nothing captured");
+            return Ok(());
+        }
         bail!("no servers were captured (see the messages above)");
     }
     Ok(())

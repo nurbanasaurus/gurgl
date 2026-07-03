@@ -85,7 +85,7 @@ configs:
 | Client | Config scanned |
 |--------|----------------|
 | Claude Code | `~/.claude.json` (user scope + per-project `mcpServers`) |
-| Claude Desktop | macOS `~/Library/Application Support/Claude/…`, Linux `~/.config/Claude/…` |
+| Claude Desktop | macOS `~/Library/Application Support/Claude/...`, Linux `~/.config/Claude/...` |
 | Cursor | `~/.cursor/mcp.json` |
 | Windsurf | `~/.codeium/windsurf/mcp_config.json` |
 | Cline (VS Code) | the `saoudrizwan.claude-dev` global storage settings |

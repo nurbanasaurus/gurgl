@@ -290,6 +290,7 @@ first_party = ["vendor.com"]               # domains you EXPECT - classified fir
 | `args` | no | Arguments to `command`. |
 | `version` | no | Explicit label; absent → the server's self-reported version from its MCP `initialize` response, else `unknown`. Distinct versions are distinct snapshots, which is what makes `diff` work. |
 | `first_party` | no | Expected domains, so gurgl can class them as first-party. |
+| `flightplan` | no | Per-server flight plan path, overriding the config-level default. Use for a server whose battery needs its own tool + args. |
 
 ### Backends
 
@@ -356,6 +357,11 @@ changing it makes past snapshots no longer directly comparable (by design: a
 different call is a different method). Note this only surfaces more hosts if the
 tool actually makes network calls - a purely local tool (e.g. filesystem reads)
 has no egress to reveal regardless of its arguments.
+
+Because a tool-specific plan only fits one server, set it per server rather than
+globally: give that `[[servers]]` entry its own `flightplan = "flightplans/..."`
+and every other server keeps the default battery. `gurgl watch --all` uses each
+server's own plan.
 
 ---
 

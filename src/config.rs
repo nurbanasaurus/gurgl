@@ -45,6 +45,12 @@ pub struct ServerSpec {
     /// Declared first-party domains for this server, used to classify egress.
     #[serde(default)]
     pub first_party: Vec<String>,
+    /// Optional per-server flight plan, overriding the config-level one. Lets a
+    /// server with tool-args steps (e.g. a fetch demo) keep its own battery
+    /// without changing how every other server is exercised. Relative paths
+    /// resolve against the config file's directory.
+    #[serde(default)]
+    pub flightplan: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -124,6 +130,15 @@ impl Config {
     /// The flight plan path, resolved relative to the config file.
     pub fn flightplan_path(&self) -> PathBuf {
         self.resolve(&self.flightplan)
+    }
+
+    /// The flight plan for one server: its own `flightplan` if set, else the
+    /// config-level default.
+    pub fn flightplan_path_for(&self, spec: &ServerSpec) -> PathBuf {
+        match &spec.flightplan {
+            Some(p) => self.resolve(p),
+            None => self.flightplan_path(),
+        }
     }
 
     pub fn server(&self, name: &str) -> Option<&ServerSpec> {

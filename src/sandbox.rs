@@ -218,6 +218,7 @@ mod tests {
             ],
             version: None,
             first_party: vec![],
+            flightplan: None,
         }
     }
 

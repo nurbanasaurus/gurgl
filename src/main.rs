@@ -286,10 +286,6 @@ fn cmd_watch(
         observe::arm_interrupt();
     }
 
-    let plan_path = cfg.flightplan_path();
-    let plan = FlightPlan::load(&plan_path)
-        .with_context(|| format!("loading flight plan {}", plan_path.display()))?;
-
     // Live dashboard when attached to a terminal; plain lines when piped or with
     // --plain, so logs and scripts are unaffected.
     let mode = if plain || !std::io::stderr().is_terminal() {
@@ -299,15 +295,20 @@ fn cmd_watch(
     };
 
     // Capture each target independently: one un-runnable server (missing runtime,
-    // a plugin that needs its client's env) must not abort the whole batch.
+    // a plugin that needs its client's env) must not abort the whole batch. The
+    // flight plan is per-server: a server's own `flightplan` wins over the default.
     let multi = targets.len() > 1;
     let mut captured = 0usize;
     let mut skipped: Vec<String> = Vec::new();
     for spec in targets {
-        match observe::capture(cfg, spec, &plan, mode, monitor).and_then(|snap| {
-            let path = store.save(&snap)?;
-            Ok((path, snap))
-        }) {
+        let plan_path = cfg.flightplan_path_for(spec);
+        match FlightPlan::load(&plan_path)
+            .with_context(|| format!("loading flight plan {}", plan_path.display()))
+            .and_then(|plan| observe::capture(cfg, spec, &plan, mode, monitor))
+            .and_then(|snap| {
+                let path = store.save(&snap)?;
+                Ok((path, snap))
+            }) {
             Ok((path, snap)) => {
                 println!(
                     "saved {}@{} -> {}",

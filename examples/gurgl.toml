@@ -1,0 +1,18 @@
+# Example config used by the bundled demo snapshots.
+# Paths below resolve relative to THIS file, so it works from any directory:
+#   gurgl --config examples/gurgl.toml list
+#   gurgl --config /abs/path/to/examples/gurgl.toml diff example-mcp
+#   gurgl --config examples/gurgl.toml allow example-mcp --format squid
+
+store = "snapshots"                        # -> examples/snapshots
+flightplan = "../flightplans/default.toml" # -> flightplans/default.toml
+mitmdump = "mitmdump"
+trials = 5
+# sandbox: omitted so the OS-aware default applies (bubblewrap on Linux,
+# sandbox-exec on macOS). The diff/allow demos don't launch a sandbox anyway.
+
+[[servers]]
+name = "example-mcp"
+command = "npx"
+args = ["-y", "example-mcp"]
+first_party = ["example-vendor.com"]

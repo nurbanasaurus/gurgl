@@ -1,0 +1,24 @@
+{
+  "server": "example-mcp",
+  "version": "1.2.0",
+  "captured_at": 1751000000,
+  "trials": 5,
+  "flightplan": "default-1a2b3c4d5e6f7081",
+  "gurgl_version": "0.1.0",
+  "hosts": [
+    {
+      "name": "registry.npmjs.org",
+      "class": "registry",
+      "reproducibility": "stable",
+      "seen_in_trials": 5,
+      "phases": ["startup"]
+    },
+    {
+      "name": "api.example-vendor.com",
+      "class": "first-party",
+      "reproducibility": "stable",
+      "seen_in_trials": 5,
+      "phases": ["startup", "tool-call"]
+    }
+  ]
+}

@@ -1,0 +1,45 @@
+{
+  "server": "example-mcp",
+  "version": "1.3.0",
+  "captured_at": 1751600000,
+  "trials": 5,
+  "flightplan": "default-1a2b3c4d5e6f7081",
+  "gurgl_version": "0.1.0",
+  "hosts": [
+    {
+      "name": "registry.npmjs.org",
+      "class": "registry",
+      "reproducibility": "stable",
+      "seen_in_trials": 5,
+      "phases": ["startup"]
+    },
+    {
+      "name": "api.example-vendor.com",
+      "class": "first-party",
+      "reproducibility": "stable",
+      "seen_in_trials": 5,
+      "phases": ["startup", "tool-call"]
+    },
+    {
+      "name": "telemetry.example-analytics.io",
+      "class": "telemetry",
+      "reproducibility": "stable",
+      "seen_in_trials": 5,
+      "phases": ["startup"]
+    },
+    {
+      "name": "beacon.unknown-cdn.example",
+      "class": "unknown",
+      "reproducibility": "stable",
+      "seen_in_trials": 5,
+      "phases": ["tool-call"]
+    },
+    {
+      "name": "edge-42.rollout-cohort.example",
+      "class": "unknown",
+      "reproducibility": "intermittent",
+      "seen_in_trials": 2,
+      "phases": ["idle"]
+    }
+  ]
+}

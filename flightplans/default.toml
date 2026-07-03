@@ -1,0 +1,26 @@
+# Default flight plan.
+#
+# The fixed, ordered battery gurgl drives against each MCP server so its egress
+# is exercised the same way every time. Keep this stable; when you change it,
+# past snapshots are no longer directly comparable (the flight-plan fingerprint
+# recorded in each snapshot is what ties an observation to its method).
+
+name = "default"
+
+[[steps]]
+phase = "startup"
+action = "initialize"
+
+[[steps]]
+phase = "enumerate"
+action = "tools/list"
+
+[[steps]]
+phase = "tool-call"
+action = "tools/call"
+# tool omitted: gurgl picks the first benign, read-only-looking tool it finds.
+
+[[steps]]
+phase = "idle"
+action = "sleep"
+seconds = 8

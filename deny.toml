@@ -1,0 +1,33 @@
+# cargo-deny configuration. gurgl is a security tool; treat dependencies as a
+# supply-chain surface. Run: cargo deny check
+
+[advisories]
+version = 2
+yanked = "deny"
+# ignore = []  # add RUSTSEC ids here only with a written justification
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"        # no wildcard version requirements
+allow-wildcard-paths = false
+
+[licenses]
+version = 2
+# Permissive licenses acceptable for a dual MIT/Apache-2.0 project.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

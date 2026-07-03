@@ -1,0 +1,7 @@
+/target
+**/*.rs.bk
+# Cargo.lock is committed: this is an installable binary, so we want reproducible builds.
+*.log
+flows.jsonl         # raw mitmdump capture scratch
+/scratch
+.DS_Store

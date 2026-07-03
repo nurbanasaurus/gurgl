@@ -34,7 +34,17 @@ pub struct ProxyEnv {
 impl ProxyEnv {
     /// (KEY, VALUE) pairs to set in the sandboxed process environment.
     pub fn vars(&self) -> Vec<(String, String)> {
+        // Ensure the sandboxed process can find its runtime on PATH. `npx` runs
+        // via `#!/usr/bin/env node`, so node must be resolvable inside the
+        // sandbox even when the launching shell's PATH differs. Prepend gurgl's
+        // and the user-local bin dirs to the inherited PATH.
+        let home = dirs::home_dir()
+            .map(|h| h.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let inherited = std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string());
+        let path = format!("{home}/.gurgl/bin:{home}/.local/bin:{inherited}");
         vec![
+            ("PATH".into(), path),
             // Route TLS through the proxy. Both cases: clients differ on which
             // they read (curl/Python honor either; Node reads both under the
             // NODE_USE_ENV_PROXY flag below).
@@ -137,6 +147,19 @@ fn build_bwrap_argv(spec: &ServerSpec, env: &ProxyEnv) -> Vec<String> {
         // reach the proxy on 127.0.0.1. Forcing *only* the proxy to be reachable
         // (netns + nftables redirect) is the roadmap hardening step.
     ];
+    // Make user-installed language runtimes reachable. Many MCP servers run on a
+    // Node/Python installed under the user's home (nvm, ~/.local, gurgl's own
+    // node) rather than in /usr, and would otherwise not exist inside the
+    // sandbox. Read-only; -try tolerates absence. (The sandbox is not a security
+    // boundary yet; see the module docs and docs/THREAT-MODEL.md.)
+    if let Some(home) = dirs::home_dir() {
+        for sub in [".local", ".gurgl", ".nvm", ".volta", ".asdf", ".fnm"] {
+            let p = home.join(sub).to_string_lossy().to_string();
+            argv.push("--ro-bind-try".into());
+            argv.push(p.clone());
+            argv.push(p);
+        }
+    }
     for (k, v) in env.vars() {
         argv.push("--setenv".into());
         argv.push(k);

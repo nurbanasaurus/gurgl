@@ -234,7 +234,11 @@ fn cmd_watch(
     };
 
     if targets.is_empty() {
-        bail!("no servers configured in gurgl.toml (add a [[servers]] entry, then retry)");
+        bail!(
+            "no MCP servers configured. Run `gurgl init` to create {}, then add \
+             (or uncomment) a [[servers]] entry and retry.",
+            config::default_config_path().display()
+        );
     }
 
     let plan_path = cfg.flightplan_path();

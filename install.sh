@@ -23,9 +23,11 @@ os="$(uname -s)"
 GURGL_HOME="${GURGL_HOME:-$HOME/.gurgl}"
 
 WITH_DEPS=1
+MODIFY_PATH=1
 for arg in "$@"; do
   case "$arg" in
     --no-deps) WITH_DEPS=0 ;;
+    --no-modify-path) MODIFY_PATH=0 ;;
     *) echo "unknown option: $arg (see: $0 --help)"; [ "$arg" = "--help" ] && exit 0 || exit 2 ;;
   esac
 done
@@ -59,6 +61,30 @@ case ":\${PATH}:" in
   *) export PATH="$GURGL_HOME/bin:\$PATH" ;;
 esac
 EOF
+
+# 3b. wire the env file into the shell profile so future shells find gurgl.
+# (A script can't change the *current* shell's PATH -- that needs a `source`,
+# printed at the end -- but it can set up every new shell.)
+PROFILE_TOUCHED=""
+if [ "$MODIFY_PATH" -eq 1 ]; then
+  case "$(basename "${SHELL:-bash}")" in
+    zsh)  profiles="$HOME/.zshrc $HOME/.zprofile" ;;
+    bash) profiles="$HOME/.bashrc $HOME/.bash_profile" ;;
+    fish) profiles="" ;;  # fish uses its own path handling; instruct below
+    *)    profiles="$HOME/.profile" ;;
+  esac
+  for p in $profiles; do
+    touch "$p"
+    if ! grep -qF '.gurgl/env' "$p" 2>/dev/null; then
+      printf '\n. "%s/env"\n' "$GURGL_HOME" >> "$p"
+      PROFILE_TOUCHED="$PROFILE_TOUCHED $p"
+    fi
+  done
+fi
+
+# 3c. create ~/.gurgl/gurgl.toml + the default flight plan so `gurgl watch` has
+# something to run immediately (idempotent: leaves an existing config alone).
+GURGL_HOME="$GURGL_HOME" "$GURGL_HOME/bin/gurgl" init >/dev/null 2>&1 || true
 
 # --- 4. runtime dependencies for `gurgl watch` -------------------------------
 install_sandbox() {
@@ -131,12 +157,17 @@ esac
 
 echo
 if command -v gurgl >/dev/null 2>&1 && [ "$(command -v gurgl)" = "$GURGL_HOME/bin/gurgl" ]; then
-  echo ">> done. gurgl is on your PATH. Next:"
+  echo ">> done. gurgl is already on this shell's PATH."
 else
-  echo ">> done. Add gurgl to your PATH (once):"
-  echo "     echo '. \"\$HOME/.gurgl/env\"' >> ~/.$(basename "${SHELL:-bash}")rc"
-  echo "     . \"$GURGL_HOME/env\""
-  echo "   then:"
+  echo ">> done."
+  if [ -n "$PROFILE_TOUCHED" ]; then
+    echo "   Added gurgl to your PATH for new shells (edited:$PROFILE_TOUCHED)."
+  elif [ "$MODIFY_PATH" -eq 0 ]; then
+    echo "   Skipped PATH setup (--no-modify-path)."
+  fi
+  # A script can't change the CURRENT shell's PATH; the user must source it.
+  echo "   For THIS terminal, run:   . \"$GURGL_HOME/env\""
 fi
+echo "   then:"
 echo "     gurgl init          # writes ~/.gurgl/gurgl.toml + default flight plan"
 echo "     gurgl --config \"$here/examples/gurgl.toml\" diff example-mcp   # try it now"

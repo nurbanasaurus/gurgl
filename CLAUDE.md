@@ -83,7 +83,8 @@ Path helpers live in `config.rs` (`gurgl_home()`, `default_config_path()`,
 - `emit.rs` - `allowlist(snapshot, Format)` for sandbox-runtime / opensnitch / squid.
 - `store.rs` - JSON snapshots at `<store>/<server>/<version>.json`.
 - `sandbox.rs` / `proxy.rs` - `build_argv()` (pure, tested) + spawn helpers.
-- `flightplan.rs` - parse/fingerprint the scripted battery.
+- `flightplan.rs` - parse/fingerprint the scripted battery; `Step::args` (TOML
+  table) lets a `tools/call` step pass real arguments, folded into the fingerprint.
 - `discover.rs` - scan known MCP client configs (Claude Desktop/Code, Cursor,
   Windsurf, Cline) *and* every `.mcp.json` under `$HOME` for configured servers;
   `--import` appends stdio ones to `gurgl.toml`. Marks each `enabled`/`bundled`/
@@ -110,8 +111,10 @@ Path helpers live in `config.rs` (`gurgl_home()`, `default_config_path()`,
 ## Next tasks (v1 polish)
 
 The live capture (`observe::run_trial`) works. Remaining:
-- **Version derivation** - resolve the actually-installed version of an npm/PyPI
-  MCP server instead of the `unknown` label / config value.
+- **Version derivation** - DONE for servers that report it: `capture()` uses the
+  MCP `initialize` response's `serverInfo.version` (precedence: config `version` >
+  server-reported > `unknown`). A server that reports no version still falls back
+  to `unknown`; deriving it from the installed npm/PyPI package is a further step.
 - **Capture hardening** - force all egress through the proxy (network namespace
   + transparent redirect on Linux; a real least-privilege Seatbelt profile on
   macOS) instead of relying on the client honoring `HTTPS_PROXY`. The sandbox is

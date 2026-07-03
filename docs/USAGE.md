@@ -288,7 +288,7 @@ first_party = ["vendor.com"]               # domains you EXPECT - classified fir
 | `name` | yes | Storage + CLI identity. |
 | `command` | yes | Executable run inside the sandbox (`npx`, `python3`, `node`, ...). |
 | `args` | no | Arguments to `command`. |
-| `version` | no | Explicit label; absent → `unknown`. |
+| `version` | no | Explicit label; absent → the server's self-reported version from its MCP `initialize` response, else `unknown`. Distinct versions are distinct snapshots, which is what makes `diff` work. |
 | `first_party` | no | Expected domains, so gurgl can class them as first-party. |
 
 ### Backends
@@ -325,7 +325,9 @@ action = "tools/list"
 [[steps]]
 phase = "tool-call"
 action = "tools/call"    # gurgl auto-picks the first benign, read-only-looking tool
-                         # (never a delete/write/send/exec-shaped one). Pin one with `tool = "..."`.
+                         # (never a delete/write/send/exec-shaped one) and calls it
+                         # with no arguments. Pin one with `tool = "..."`, and pass
+                         # real input with `args = { ... }` (see below).
 
 [[steps]]
 phase = "idle"
@@ -335,6 +337,25 @@ seconds = 8              # catch background beacons / deferred telemetry
 
 Supported `action`s: `initialize`, `tools/list`, `tools/call`, `sleep`.
 `gurgl init` writes this default to `~/.gurgl/flightplans/default.toml`.
+
+**Exercising a tool with real input.** Many tools only reach the network when
+given arguments (a `fetch` tool needs a URL, a `search` tool needs a query), so a
+call with empty `{}` shows only the server's startup egress. Name the tool and
+pass `args` (a TOML table sent as the tool's JSON arguments):
+
+```toml
+[[steps]]
+phase = "tool-call"
+action = "tools/call"
+tool = "fetch"
+args = { url = "https://example.com" }
+```
+
+Keep the tool read-only. `args` is part of the flight-plan fingerprint, so
+changing it makes past snapshots no longer directly comparable (by design: a
+different call is a different method). Note this only surfaces more hosts if the
+tool actually makes network calls - a purely local tool (e.g. filesystem reads)
+has no egress to reveal regardless of its arguments.
 
 ---
 

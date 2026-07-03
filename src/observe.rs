@@ -342,10 +342,7 @@ fn run_trial(
             "tools/call" => {
                 if let Some(tool) = step.tool.clone().or_else(|| chosen_tool.clone()) {
                     id += 1;
-                    send(
-                        &mut stdin,
-                        &mcp::tools_call(id, &tool, &serde_json::json!({})),
-                    );
+                    send(&mut stdin, &mcp::tools_call(id, &tool, &step.tool_args()));
                     let _ = read_response(&rx, id, Duration::from_secs(25));
                 } else {
                     reporter.note("no benign tool to call; skipping tools/call step");

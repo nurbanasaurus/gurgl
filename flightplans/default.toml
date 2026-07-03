@@ -18,7 +18,14 @@ action = "tools/list"
 [[steps]]
 phase = "tool-call"
 action = "tools/call"
-# tool omitted: gurgl picks the first benign, read-only-looking tool it finds.
+# tool omitted: gurgl picks the first benign, read-only-looking tool it finds,
+# and calls it with no arguments. Many tools only reach the network when given
+# real input, so to capture that egress, name the tool and pass args, e.g.:
+#   tool = "fetch"
+#   args = { url = "https://example.com" }
+# args is a TOML table sent as the tool's JSON arguments. Keep tools read-only;
+# gurgl will not auto-pick a destructive-looking one, but an explicit tool here
+# is whatever you name.
 
 [[steps]]
 phase = "idle"

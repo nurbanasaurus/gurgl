@@ -75,15 +75,20 @@ Path helpers live in `config.rs` (`gurgl_home()`, `default_config_path()`,
 - `model.rs` - `Host`, `Snapshot`, `HostClass`, `Reproducibility`, `classify()`.
 - `observe.rs` - `aggregate()` (pure reproduction gate) + `capture()`/`run_trial()`
   live pipeline (spawn proxy, launch sandboxed server, drive MCP over stdio,
-  attribute hosts to phases by timestamp). Implemented and verified.
+  attribute hosts to phases by timestamp). Implemented and verified. `Monitor`
+  controls run length: `Battery` (default, N trials) or `Hold(Option<Duration>)`
+  for `watch --for`/`--until-closed` (one long observation; Ctrl-C via a SIGINT
+  handler in the `interrupt` submodule, unix-only, using `libc`).
 - `diff.rs` - pure `diff(from, to) -> SnapshotDiff`.
 - `emit.rs` - `allowlist(snapshot, Format)` for sandbox-runtime / opensnitch / squid.
 - `store.rs` - JSON snapshots at `<store>/<server>/<version>.json`.
 - `sandbox.rs` / `proxy.rs` - `build_argv()` (pure, tested) + spawn helpers.
 - `flightplan.rs` - parse/fingerprint the scripted battery.
 - `discover.rs` - scan known MCP client configs (Claude Desktop/Code, Cursor,
-  Windsurf, Cline) for configured servers; `--import` appends stdio ones to
-  `gurgl.toml`. Read-only on client configs; never reads `env` values.
+  Windsurf, Cline) *and* every `.mcp.json` under `$HOME` for configured servers;
+  `--import` appends stdio ones to `gurgl.toml`. Marks each `enabled`/`bundled`/
+  `configured` from the client's own enable records (`EnabledIndex`). Read-only on
+  client configs; never reads `env` values.
 - `mcp.rs` - minimal MCP JSON-RPC message builders.
 - `report.rs` - `Reporter` trait + `PlainReporter` (piped/`--plain`) and
   `DashboardReporter` (live ANSI dashboard, no deps, TTY-gated). `watch` only.
@@ -97,7 +102,10 @@ Path helpers live in `config.rs` (`gurgl_home()`, `default_config_path()`,
 - Match the existing comment density: comments state *constraints and why*, not
   what the next line does.
 - Any new dependency is a supply-chain decision - this is a security tool.
-  Prefer std; justify additions; keep `cargo deny` / `cargo audit` green.
+  Prefer std; justify additions; keep `cargo deny` / `cargo audit` green. Direct
+  deps: clap, serde, serde_json, toml, anyhow, dirs, and (unix) `libc` for the
+  `watch` SIGINT handler - `libc` was already transitive via `dirs`, so it added
+  no new crate. No signal-handling wrapper crates; the handler is ~5 lines.
 
 ## Next tasks (v1 polish)
 

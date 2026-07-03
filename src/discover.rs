@@ -19,6 +19,31 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
+/// Whether a discovered server is actually turned on in its client, or merely
+/// present on disk. Determined from the client's own enable records; when we
+/// cannot find a positive "on" record we never claim `Enabled`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Status {
+    /// Positively listed as enabled in the client config (authoritative).
+    Enabled,
+    /// A plugin shipped by a marketplace/plugin dir, but not enabled: available,
+    /// not something you turned on.
+    Bundled,
+    /// Present in a config (a project/user `.mcp.json`, a client's server list)
+    /// but not found in any enable record - configured, not confirmed active.
+    Configured,
+}
+
+impl std::fmt::Display for Status {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.pad(match self {
+            Status::Enabled => "enabled",
+            Status::Bundled => "bundled",
+            Status::Configured => "configured",
+        })
+    }
+}
+
 /// One MCP server found in a client config.
 #[derive(Debug, Clone)]
 pub struct Discovered {
@@ -32,6 +57,8 @@ pub struct Discovered {
     pub has_env: bool,
     /// Human-readable source, e.g. "Claude Code (~/.claude.json)".
     pub source: String,
+    /// Whether the client has this server enabled, or it is just present.
+    pub status: Status,
 }
 
 impl Discovered {
@@ -127,6 +154,12 @@ pub fn discover() -> Vec<Discovered> {
             d.args.clone(),
         ))
     });
+
+    // Mark each as enabled / bundled / configured from the client enable records.
+    let idx = EnabledIndex::load();
+    for d in &mut out {
+        d.status = idx.status_for(d);
+    }
     out
 }
 
@@ -274,6 +307,97 @@ fn parse(name: &str, spec: &Value, source: &str) -> Discovered {
         url,
         has_env,
         source: source.to_string(),
+        // Filled in once by `discover()` after the client enable records are read.
+        status: Status::Configured,
+    }
+}
+
+/// The set of servers/plugins the client(s) have explicitly enabled, read from
+/// their own config so gurgl can distinguish "turned on" from "just present".
+#[derive(Default)]
+struct EnabledIndex {
+    /// `.mcp.json` server names in some project's `enabledMcpjsonServers`.
+    mcp_servers: std::collections::HashSet<String>,
+    /// Plugin names from an `enabledPlugins` record (normalised, `name@mkt` ->
+    /// `name`).
+    plugins: std::collections::HashSet<String>,
+}
+
+impl EnabledIndex {
+    /// Read the known enable records. Best-effort and read-only: a missing or
+    /// unparseable file just contributes nothing.
+    fn load() -> Self {
+        let mut idx = EnabledIndex::default();
+        let Some(home) = dirs::home_dir() else {
+            return idx;
+        };
+
+        // Claude Code: per-project `enabledMcpjsonServers` and `enabledPlugins`
+        // live in ~/.claude.json.
+        if let Some(json) = read_json(&home.join(".claude.json")) {
+            if let Some(projects) = json.get("projects").and_then(|v| v.as_object()) {
+                for pv in projects.values() {
+                    collect_str_array(pv.get("enabledMcpjsonServers"), &mut idx.mcp_servers);
+                    collect_plugin_ids(pv.get("enabledPlugins"), &mut idx.plugins);
+                }
+            }
+            collect_plugin_ids(json.get("enabledPlugins"), &mut idx.plugins);
+        }
+
+        // Plugin enablement can also sit in the user settings.
+        for name in ["settings.json", "settings.local.json"] {
+            if let Some(json) = read_json(&home.join(".claude").join(name)) {
+                collect_plugin_ids(json.get("enabledPlugins"), &mut idx.plugins);
+            }
+        }
+        idx
+    }
+
+    fn status_for(&self, d: &Discovered) -> Status {
+        let is_plugin = d.source.starts_with("plugin ") || d.source.contains("/plugins/");
+        let enabled =
+            self.mcp_servers.contains(&d.name) || (is_plugin && self.plugins.contains(&d.name));
+        if enabled {
+            Status::Enabled
+        } else if is_plugin {
+            Status::Bundled
+        } else {
+            Status::Configured
+        }
+    }
+}
+
+fn read_json(path: &Path) -> Option<Value> {
+    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+}
+
+fn collect_str_array(v: Option<&Value>, out: &mut std::collections::HashSet<String>) {
+    if let Some(arr) = v.and_then(|x| x.as_array()) {
+        for s in arr.iter().filter_map(|s| s.as_str()) {
+            out.insert(s.to_string());
+        }
+    }
+}
+
+/// Pull enabled plugin identifiers from an `enabledPlugins` value, which is
+/// either an object (`{"name@mkt": true}`) or an array (`["name@mkt"]`). The
+/// marketplace suffix is dropped so it matches a plugin's server name.
+fn collect_plugin_ids(v: Option<&Value>, out: &mut std::collections::HashSet<String>) {
+    let norm = |k: &str| k.split('@').next().unwrap_or(k).to_string();
+    match v {
+        Some(Value::Object(m)) => {
+            for (k, val) in m {
+                if val.as_bool() != Some(false) {
+                    out.insert(norm(k));
+                }
+            }
+        }
+        Some(Value::Array(a)) => {
+            for s in a.iter().filter_map(|s| s.as_str()) {
+                out.insert(norm(s));
+            }
+        }
+        _ => {}
     }
 }
 
@@ -370,6 +494,7 @@ mod tests {
             url: None,
             has_env: false,
             source: "Test".into(),
+            status: Status::Configured,
         };
         let block = to_toml_block(&d);
         let cfg: crate::config::Config = toml::from_str(&block).unwrap();
@@ -377,5 +502,59 @@ mod tests {
         assert_eq!(cfg.servers[0].name, "filesystem");
         assert_eq!(cfg.servers[0].command, "npx");
         assert_eq!(cfg.servers[0].args.len(), 2);
+    }
+
+    fn disc(name: &str, source: &str) -> Discovered {
+        Discovered {
+            name: name.into(),
+            command: Some("bun".into()),
+            args: vec![],
+            url: None,
+            has_env: false,
+            source: source.into(),
+            status: Status::Configured,
+        }
+    }
+
+    #[test]
+    fn status_marks_enabled_bundled_and_configured() {
+        let mut idx = EnabledIndex::default();
+        idx.mcp_servers.insert("statewright".into());
+        idx.plugins.insert("discord".into());
+
+        // A plugin listed in enabledPlugins -> Enabled.
+        let on = disc(
+            "discord",
+            "plugin (~/.claude/plugins/.../discord/.mcp.json)",
+        );
+        assert_eq!(idx.status_for(&on), Status::Enabled);
+
+        // A plugin NOT in the enable list -> Bundled (available, not on).
+        let off = disc(
+            "telegram",
+            "plugin (~/.claude/plugins/.../telegram/.mcp.json)",
+        );
+        assert_eq!(idx.status_for(&off), Status::Bundled);
+
+        // A project/user config server in enabledMcpjsonServers -> Enabled.
+        let approved = disc("statewright", "project (~/.claude/.mcp.json)");
+        assert_eq!(idx.status_for(&approved), Status::Enabled);
+
+        // A configured-but-unapproved project server -> Configured.
+        let pending = disc("monarch", "project (~/some/repo/.mcp.json)");
+        assert_eq!(idx.status_for(&pending), Status::Configured);
+    }
+
+    #[test]
+    fn collect_plugin_ids_handles_object_and_array() {
+        let mut out = std::collections::HashSet::new();
+        collect_plugin_ids(
+            Some(&json!({"discord@official": true, "off@official": false})),
+            &mut out,
+        );
+        collect_plugin_ids(Some(&json!(["telegram@official"])), &mut out);
+        assert!(out.contains("discord"));
+        assert!(out.contains("telegram"));
+        assert!(!out.contains("off")); // explicitly false -> not enabled
     }
 }

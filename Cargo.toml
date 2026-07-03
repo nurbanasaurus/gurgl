@@ -19,6 +19,12 @@ toml = "0.8"
 anyhow = "1"
 dirs = "5"
 
+# Unix SIGINT handling for `watch --until-closed` (stop cleanly on Ctrl-C, save
+# what was seen, restore the terminal). Kept to the one foundational crate rather
+# than a signal-handling wrapper; no transitive deps. Windows is out of scope.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [profile.release]
 strip = true
 lto = true

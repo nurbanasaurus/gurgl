@@ -167,16 +167,26 @@ example.org                              unknown      stable       2/2
 
 You do not have to hand-list servers. `gurgl discover` scans the standard MCP
 client configs on this machine - Claude Desktop, Claude Code (`~/.claude.json`),
-Cursor, Windsurf, and Cline - and shows what it finds:
+Cursor, Windsurf, Cline - and every project-scoped `.mcp.json` under your home,
+then shows what it finds:
 
 ```
 found 3 MCP server(s) configured on this machine:
 
-NAME                   KIND    COMMAND                            SOURCE
-filesystem             stdio   npx -y @modelcontextprotocol/se... Claude Code (~/.claude.json)
-github                 stdio   npx -y @modelcontextprotocol/se... Cursor (~/.cursor/mcp.json) [env]
-linear-remote          remote  https://mcp.linear.app/sse         Cursor (~/.cursor/mcp.json)
+NAME                 STATUS     KIND   COMMAND                        SOURCE
+statewright          enabled    remote https://mcp.statewright.ai     project (~/.claude/.mcp.json)
+filesystem           configured stdio  npx -y @modelcontextprotocol... Claude Code (~/.claude.json)
+telegram             bundled    stdio  bun run ...                    plugin (~/.claude/plugins/.../telegram/.mcp.json)
 ```
+
+The `STATUS` column tells you what is actually on, read from each client's own
+config:
+
+- **enabled** - positively listed as on (in `enabledMcpjsonServers`, or an
+  `enabledPlugins` record). This is the only status gurgl asserts from evidence.
+- **bundled** - a plugin that ships with a marketplace but is not enabled.
+  Present on disk, not something you turned on.
+- **configured** - present in a config, but gurgl found no enable record for it.
 
 `--import` appends the local `stdio` servers to your `gurgl.toml` so `gurgl watch`
 can capture them. It is safe to re-run (it skips servers already listed). Two
@@ -192,6 +202,23 @@ class as they are contacted. Piped or non-interactive output stays plain, so log
 and scripts are unaffected; force plain anywhere with `--plain`. It adds no
 dependencies (plain ANSI on the alternate screen) and restores your terminal when
 it finishes.
+
+### Watching over time
+
+By default `gurgl watch` runs the repeated-trial battery and exits. To sit and
+watch a server instead:
+
+```sh
+gurgl watch <server> --for 5m         # run once, then monitor for 5 minutes
+gurgl watch <server> --until-closed   # monitor until you press Ctrl-C
+```
+
+Both run one long observation (the flight plan once, then a live monitoring hold)
+rather than the battery, so you can see what a server beacons at rest. `--for`
+accepts `30s`, `5m`, `1h` (a bare number is seconds). `--until-closed` stops
+cleanly on Ctrl-C and still saves what it captured. Because these are a single
+observation, everything is recorded as seen 1/1 - use the default battery when
+you want the reproduction gate.
 
 ## Where things live: `~/.gurgl`
 
@@ -234,10 +261,10 @@ Working from a source clone instead? `make update` (git pull + reinstall) and
 | Command | What it does |
 |---------|--------------|
 | `gurgl init` | Create `~/.gurgl` (config, default flight plan, store). |
-| `gurgl discover [--import]` | Find MCP servers configured on this machine; `--import` adds the stdio ones to `gurgl.toml`. |
+| `gurgl discover [--import]` | Find MCP servers on this machine (with enabled/bundled status); `--import` adds the stdio ones to `gurgl.toml`. |
 | `gurgl list` | List captured servers and versions. |
 | `gurgl show <server> [version]` | Show observed hosts for a version (default: latest). |
-| `gurgl watch [<server>] [--all]` | Capture egress behind the proxy (needs mitmproxy + sandbox). |
+| `gurgl watch [<server>] [--all] [--for <dur>] [--until-closed]` | Capture egress behind the proxy (needs mitmproxy + sandbox). `--for`/`--until-closed` watch over time. |
 | `gurgl diff <server> [--from --to]` | Diff egress between two versions (default: latest two). |
 | `gurgl allow <server> [--format ...]` | Emit an allowlist (`sandbox-runtime` / `opensnitch` / `squid`). |
 | `gurgl update` (`-u`, `--update`) | Pull the latest source and reinstall. Runs only when invoked; no auto-update. |

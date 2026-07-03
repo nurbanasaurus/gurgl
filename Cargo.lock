@@ -155,6 +155,7 @@ dependencies = [
  "anyhow",
  "clap",
  "dirs",
+ "libc",
  "serde",
  "serde_json",
  "toml",

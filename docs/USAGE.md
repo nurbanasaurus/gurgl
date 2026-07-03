@@ -77,17 +77,25 @@ configs:
 | Cursor | `~/.cursor/mcp.json` |
 | Windsurf | `~/.codeium/windsurf/mcp_config.json` |
 | Cline (VS Code) | the `saoudrizwan.claude-dev` global storage settings |
-| project-local | `./.mcp.json`, `./.cursor/mcp.json` in the current directory |
+| project / plugin | every `.mcp.json` under `$HOME` (Claude Code per-project configs, plugin-shipped servers) and `./.cursor/mcp.json` |
 
 ```console
 $ gurgl discover
 found 3 MCP server(s) configured on this machine:
 
-NAME                   KIND    COMMAND                            SOURCE
-filesystem             stdio   npx -y @modelcontextprotocol/se... Claude Code (~/.claude.json)
-github                 stdio   npx -y @modelcontextprotocol/se... Cursor (~/.cursor/mcp.json) [env]
-linear-remote          remote  https://mcp.linear.app/sse         Cursor (~/.cursor/mcp.json)
+NAME                 STATUS     KIND   COMMAND                        SOURCE
+statewright          enabled    remote https://mcp.statewright.ai     project (~/.claude/.mcp.json)
+filesystem           configured stdio  npx -y @modelcontextprotocol... Claude Code (~/.claude.json)
+telegram             bundled    stdio  bun run ...                    plugin (~/.claude/plugins/.../telegram/.mcp.json)
 ```
+
+The `STATUS` column is read from each client's own config so you can tell what is
+actually on from what merely ships on disk:
+
+- **enabled** - positively listed as on (a project's `enabledMcpjsonServers`, or
+  an `enabledPlugins` record). The only status gurgl asserts from evidence.
+- **bundled** - a plugin present under a marketplace/plugin dir but not enabled.
+- **configured** - present in a config, but no enable record was found for it.
 
 `--import` appends the local `stdio` servers to `gurgl.toml` (creating it if
 needed), skipping any already listed, so re-running is safe. Two limits it prints
@@ -156,6 +164,26 @@ to a file, in CI) or with `--plain`. In a terminal, `watch` instead shows a live
 dashboard: a trial progress bar, per-phase timers, and hosts streaming in colored
 by class. It draws on the alternate screen and restores your terminal on exit, so
 scrollback is untouched; the final snapshot summary is left in place afterward.
+
+**Watching over time.** By default `watch` runs the `trials` battery and exits.
+Two flags turn it into a live monitor instead - one long observation (the flight
+plan once, then a monitoring hold), so you can watch what a server beacons at rest:
+
+| Flag | Behaviour |
+|------|-----------|
+| `--for <dur>` | Monitor for a fixed time, then stop and save. `<dur>` is `30s`, `5m`, `1h`, or a bare number of seconds. |
+| `--until-closed` | Monitor until you press Ctrl-C (or the server exits), then stop and save. |
+
+```console
+$ gurgl watch statewright --for 5m
+$ gurgl watch statewright --until-closed      # Ctrl-C to stop
+```
+
+These force a single observation, so every host is recorded as seen `1/1`; the
+reproduction gate needs the multi-trial battery, so use the default `watch` when
+you intend to diff. `--until-closed` catches Ctrl-C to stop cleanly, save what it
+saw, and restore the terminal (on Unix). `--for` and `--until-closed` are mutually
+exclusive.
 
 ### `gurgl diff`
 

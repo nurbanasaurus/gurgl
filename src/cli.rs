@@ -75,6 +75,14 @@ pub enum Commands {
         /// Capture every configured server (the default when no name is given).
         #[arg(long)]
         all: bool,
+        /// Watch for a fixed time, then stop and save (e.g. 30s, 5m, 1h). Runs
+        /// one long observation instead of the repeated-trial battery.
+        #[arg(long = "for", value_name = "DURATION", conflicts_with = "until_closed")]
+        duration: Option<String>,
+        /// Keep watching until you stop it with Ctrl-C, then save. One long
+        /// observation.
+        #[arg(long = "until-closed")]
+        until_closed: bool,
     },
 
     /// Find MCP servers configured on this machine (Claude, Cursor, Windsurf, ...).

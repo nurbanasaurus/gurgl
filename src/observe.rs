@@ -23,6 +23,56 @@ use crate::proxy::{FlowHost, RawFlow};
 use crate::report::{self, Reporter};
 use crate::{mcp, proxy, sandbox};
 
+/// How long a `watch` runs.
+#[derive(Debug, Clone, Copy)]
+pub enum Monitor {
+    /// The default: the repeated-trial battery (`cfg.trials` runs of the plan),
+    /// so the reproduction gate can separate stable egress from cohort noise.
+    Battery,
+    /// One long observation: run the flight plan once, then hold in a live
+    /// monitoring phase. `Some(d)` stops after `d`; `None` runs until Ctrl-C.
+    Hold(Option<Duration>),
+}
+
+/// Process-wide "user asked us to stop" flag, set by a SIGINT handler so a
+/// `Hold(None)` monitor can break its loop, tear down, and still save. Without
+/// this, Ctrl-C would kill us mid-capture and leave the dashboard's alternate
+/// screen up (Drop does not run on an uncaught signal).
+#[cfg(unix)]
+mod interrupt {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static STOP: AtomicBool = AtomicBool::new(false);
+
+    extern "C" fn on_signal(_sig: libc::c_int) {
+        // Storing to an atomic is async-signal-safe.
+        STOP.store(true, Ordering::SeqCst);
+    }
+
+    /// Install the SIGINT handler (idempotent enough to call once per watch).
+    pub fn install() {
+        unsafe {
+            libc::signal(libc::SIGINT, on_signal as *const () as usize);
+        }
+    }
+
+    pub fn requested() -> bool {
+        STOP.load(Ordering::SeqCst)
+    }
+}
+#[cfg(not(unix))]
+mod interrupt {
+    pub fn install() {}
+    pub fn requested() -> bool {
+        false
+    }
+}
+
+/// Arrange for Ctrl-C to request a clean stop rather than kill the process.
+pub fn arm_interrupt() {
+    interrupt::install();
+}
+
 /// Aggregate per-trial host observations into final hosts, applying the
 /// reproduction gate: a host is `Stable` only if it appears in every trial.
 pub fn aggregate(trials: &[Vec<FlowHost>], first_party: &[String]) -> Vec<Host> {
@@ -89,6 +139,7 @@ pub fn capture(
     spec: &ServerSpec,
     plan: &FlightPlan,
     mode: report::Mode,
+    monitor: Monitor,
 ) -> Result<Snapshot> {
     // Preflight before taking over the terminal, so a missing-backend error
     // prints normally rather than inside the dashboard's alternate screen.
@@ -104,12 +155,20 @@ pub fn capture(
             spec.command
         );
     }
-    let mut reporter = report::reporter_for(mode, &spec.name, cfg.trials);
 
-    let mut trials: Vec<Vec<FlowHost>> = Vec::with_capacity(cfg.trials as usize);
-    for i in 1..=cfg.trials {
-        reporter.trial_start(i, cfg.trials);
-        let hosts = run_trial(cfg, spec, plan, i, reporter.as_mut())
+    // A timed / until-closed watch is a single long observation, not the
+    // repeated-trial battery: running the plan N times for minutes each is not
+    // what "watch for 5m" means, and the reproduction gate is moot with one run.
+    let trial_count = match monitor {
+        Monitor::Battery => cfg.trials.max(1),
+        Monitor::Hold(_) => 1,
+    };
+    let mut reporter = report::reporter_for(mode, &spec.name, trial_count);
+
+    let mut trials: Vec<Vec<FlowHost>> = Vec::with_capacity(trial_count as usize);
+    for i in 1..=trial_count {
+        reporter.trial_start(i, trial_count);
+        let hosts = run_trial(cfg, spec, plan, i, monitor, reporter.as_mut())
             .with_context(|| format!("trial {i} of {}", spec.name))?;
         let uniq: std::collections::BTreeSet<&String> = hosts.iter().map(|h| &h.host).collect();
         reporter.trial_end(i, uniq.len());
@@ -129,7 +188,7 @@ pub fn capture(
             .clone()
             .unwrap_or_else(|| "unknown".to_string()),
         captured_at,
-        trials: cfg.trials,
+        trials: trial_count,
         flightplan: plan.fingerprint(),
         gurgl_version: env!("CARGO_PKG_VERSION").to_string(),
         hosts,
@@ -155,6 +214,7 @@ fn run_trial(
     spec: &ServerSpec,
     plan: &FlightPlan,
     trial: u32,
+    monitor: Monitor,
     reporter: &mut dyn Reporter,
 ) -> Result<Vec<FlowHost>> {
     // Per-trial scratch (its own flow file + addon copy).
@@ -291,6 +351,40 @@ fn run_trial(
             &mut surfaced,
             reporter,
         );
+    }
+
+    // --- optional live monitoring hold (watch --for / --until-closed) ---
+    // After the scripted plan, keep the server up and stream egress for a fixed
+    // time or until Ctrl-C, so you can watch what it beacons at rest.
+    if let Monitor::Hold(dur) = monitor {
+        let phase = "monitor";
+        phase_marks.push((now_epoch(), phase.to_string()));
+        reporter.phase(phase);
+        let start = Instant::now();
+        loop {
+            if interrupt::requested() {
+                reporter.note("stopping (Ctrl-C); saving what was captured");
+                break;
+            }
+            if let Some(d) = dur {
+                if start.elapsed() >= d {
+                    break;
+                }
+            }
+            // If the server exits on its own, there is nothing left to watch.
+            if matches!(server_guard.0.try_wait(), Ok(Some(_))) {
+                reporter.note("server process exited; ending watch");
+                break;
+            }
+            thread::sleep(Duration::from_millis(200));
+            surface_hosts(
+                &flows_path,
+                phase,
+                &spec.first_party,
+                &mut surfaced,
+                reporter,
+            );
+        }
     }
 
     // --- tear down: close stdin, let requests flush, then kill (guards) ---

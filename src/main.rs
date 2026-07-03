@@ -64,9 +64,20 @@ fn main() -> Result<()> {
             version,
             format,
         }) => cmd_allow(&store, server, version.as_deref(), format),
-        Some(Commands::Watch { server, all }) => {
-            cmd_watch(&cfg, &store, server.as_deref(), *all, cli.plain)
-        }
+        Some(Commands::Watch {
+            server,
+            all,
+            duration,
+            until_closed,
+        }) => cmd_watch(
+            &cfg,
+            &store,
+            server.as_deref(),
+            *all,
+            cli.plain,
+            duration.as_deref(),
+            *until_closed,
+        ),
         Some(Commands::Discover { import }) => cmd_discover(*import),
     }
 }
@@ -240,6 +251,8 @@ fn cmd_watch(
     server: Option<&str>,
     _all: bool,
     plain: bool,
+    duration: Option<&str>,
+    until_closed: bool,
 ) -> Result<()> {
     // A named server watches just that one; bare `gurgl watch` (like `--all`)
     // watches every server configured in gurgl.toml.
@@ -259,6 +272,20 @@ fn cmd_watch(
         );
     }
 
+    // How long to watch: the repeated-trial battery (default), a fixed hold, or
+    // until Ctrl-C.
+    let monitor = if until_closed {
+        observe::Monitor::Hold(None)
+    } else if let Some(s) = duration {
+        observe::Monitor::Hold(Some(parse_hold(s)?))
+    } else {
+        observe::Monitor::Battery
+    };
+    // For a long/indefinite watch, make Ctrl-C a clean stop that still saves.
+    if matches!(monitor, observe::Monitor::Hold(_)) {
+        observe::arm_interrupt();
+    }
+
     let plan_path = cfg.flightplan_path();
     let plan = FlightPlan::load(&plan_path)
         .with_context(|| format!("loading flight plan {}", plan_path.display()))?;
@@ -272,7 +299,7 @@ fn cmd_watch(
     };
 
     for spec in targets {
-        let snap = observe::capture(cfg, spec, &plan, mode)?;
+        let snap = observe::capture(cfg, spec, &plan, mode, monitor)?;
         let path = store.save(&snap)?;
         println!(
             "saved {}@{} -> {}",
@@ -282,6 +309,28 @@ fn cmd_watch(
         );
     }
     Ok(())
+}
+
+/// Parse a `--for` duration like `30s`, `5m`, `1h` (a bare number is seconds).
+fn parse_hold(s: &str) -> Result<std::time::Duration> {
+    let s = s.trim();
+    let (num, mult) = if let Some(v) = s.strip_suffix('s') {
+        (v, 1)
+    } else if let Some(v) = s.strip_suffix('m') {
+        (v, 60)
+    } else if let Some(v) = s.strip_suffix('h') {
+        (v, 3600)
+    } else {
+        (s, 1)
+    };
+    let n: u64 = num
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid --for duration '{s}': use e.g. 30s, 5m, 1h"))?;
+    if n == 0 {
+        bail!("--for duration must be greater than zero");
+    }
+    Ok(std::time::Duration::from_secs(n * mult))
 }
 
 fn cmd_discover(import: bool) -> Result<()> {
@@ -300,7 +349,10 @@ fn cmd_discover(import: bool) -> Result<()> {
         "found {} MCP server(s) configured on this machine:\n",
         found.len()
     );
-    println!("{:<22} {:<7} {:<34} SOURCE", "NAME", "KIND", "COMMAND");
+    println!(
+        "{:<20} {:<10} {:<6} {:<30} SOURCE",
+        "NAME", "STATUS", "KIND", "COMMAND"
+    );
     for d in &found {
         let kind = if d.is_stdio() { "stdio" } else { "remote" };
         let detail = if d.is_stdio() {
@@ -315,19 +367,39 @@ fn cmd_discover(import: bool) -> Result<()> {
         };
         let mark = if d.has_env { " [env]" } else { "" };
         println!(
-            "{:<22} {:<7} {:<34} {}{}",
-            truncate(&d.name, 22),
+            "{:<20} {:<10} {:<6} {:<30} {}{}",
+            truncate(&d.name, 20),
+            d.status,
             kind,
-            truncate(&detail, 34),
+            truncate(&detail, 30),
             d.source,
             mark
         );
     }
 
+    let enabled = found
+        .iter()
+        .filter(|d| d.status == discover::Status::Enabled)
+        .count();
+    let bundled = found
+        .iter()
+        .filter(|d| d.status == discover::Status::Bundled)
+        .count();
+    println!(
+        "\nstatus: {enabled} enabled, {bundled} bundled (plugin, not enabled), {} configured (present, \
+         not confirmed on).",
+        found.len() - enabled - bundled
+    );
+    println!(
+        "note: 'enabled' is read from each client's own config; 'bundled' plugins ship with a\n\
+         marketplace but are not turned on; 'configured' means present but gurgl found no enable\n\
+         record for it."
+    );
+
     let remote = found.iter().filter(|d| !d.is_stdio()).count();
     if remote > 0 {
         println!(
-            "\nnote: {remote} remote (url) server(s) are listed for inventory but gurgl cannot\n\
+            "note: {remote} remote (url) server(s) are listed for inventory but gurgl cannot\n\
              capture them: it watches local stdio subprocesses, not remote HTTP/SSE endpoints."
         );
     }

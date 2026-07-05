@@ -126,6 +126,10 @@ fn run() -> Result<i32> {
             version,
             clear,
         }) => cmd_accept(&store, server, version.as_deref(), *clear).map(|_| 0),
+        Some(Commands::Doctor) => cmd_doctor(&cfg, &store),
+        Some(Commands::Explain { server, host }) => {
+            cmd_explain(&store, server, host.as_deref()).map(|_| 0)
+        }
     }
 }
 
@@ -822,6 +826,317 @@ fn cmd_watch(
         println!("\nno drift needing scrutiny - exit 0.");
     }
     Ok(0)
+}
+
+/// `gurgl doctor`: readiness + capture-fidelity report for THIS machine.
+/// Read-only; runs nothing but version probes. Every finding is phrased as
+/// coverage ("a capture here will include/miss X because Y"), never as a
+/// safety verdict. Exits 1 when something would block `gurgl watch`.
+fn cmd_doctor(cfg: &Config, store: &Store) -> Result<i32> {
+    let mut blockers = 0usize;
+    let ok = |s: &str| println!("  [ok]      {s}");
+    let warn = |s: &str| println!("  [warn]    {s}");
+    let missing = |s: &str| println!("  [missing] {s}");
+
+    println!("gurgl doctor - readiness and capture fidelity on this machine\n");
+
+    // --- setup ----------------------------------------------------------------
+    println!("setup");
+    let local = PathBuf::from("gurgl.toml");
+    let home_cfg = config::default_config_path();
+    if local.is_file() {
+        ok(&format!("config: ./{} (project-local)", local.display()));
+    } else if home_cfg.is_file() {
+        ok(&format!("config: {}", home_cfg.display()));
+    } else {
+        blockers += 1;
+        missing("config: none found - run `gurgl init`");
+    }
+    if cfg.servers.is_empty() {
+        warn("servers: none configured - run `gurgl discover --import` or edit gurgl.toml");
+    } else {
+        ok(&format!("servers: {} configured", cfg.servers.len()));
+    }
+    let home_bin = config::gurgl_home().join("bin");
+    let on_shell_path = std::env::var("PATH")
+        .map(|p| std::env::split_paths(&p).any(|d| d == home_bin))
+        .unwrap_or(false);
+    if on_shell_path {
+        ok(&format!(
+            "PATH: {} is on this shell's PATH",
+            home_bin.display()
+        ));
+    } else {
+        warn(&format!(
+            "PATH: {} not on this shell's PATH - run: . \"$HOME/.gurgl/env\"",
+            home_bin.display()
+        ));
+    }
+    let captures: usize = store
+        .servers()?
+        .iter()
+        .map(|s| store.versions(s).map(|v| v.len()).unwrap_or(0))
+        .sum();
+    ok(&format!(
+        "store: {} ({captures} capture(s))",
+        store.root().display()
+    ));
+
+    // --- capture backends -------------------------------------------------------
+    println!("\ncapture backends (needed for `watch` only)");
+    let sandbox_bin = sandbox::required_binary(cfg.sandbox);
+    if observe::on_path(sandbox_bin) {
+        ok(&format!("sandbox: {sandbox_bin}"));
+    } else {
+        blockers += 1;
+        missing(&format!(
+            "sandbox: {sandbox_bin} - see `gurgl watch`'s preflight for the fix"
+        ));
+    }
+    match probe_version(&cfg.mitmdump, &["--version"]) {
+        Some(v) => ok(&format!("proxy: {} ({})", cfg.mitmdump, v)),
+        None => {
+            blockers += 1;
+            missing(&format!("proxy: {} (mitmproxy) not on PATH", cfg.mitmdump));
+        }
+    }
+    let ca = config::gurgl_home()
+        .join("mitmproxy")
+        .join("mitmproxy-ca-cert.pem");
+    if ca.is_file() {
+        ok("lab CA: generated");
+    } else {
+        warn("lab CA: not yet generated (created automatically on the first `watch`)");
+    }
+
+    // --- per-server runtimes ----------------------------------------------------
+    if !cfg.servers.is_empty() {
+        println!("\nconfigured servers");
+        for spec in &cfg.servers {
+            if observe::on_path(&spec.command) {
+                ok(&format!(
+                    "{}: launch command '{}' found",
+                    spec.name, spec.command
+                ));
+            } else {
+                blockers += 1;
+                missing(&format!(
+                    "{}: launch command '{}' not on PATH (its runtime, not a gurgl dep)",
+                    spec.name, spec.command
+                ));
+            }
+        }
+    }
+
+    // --- capture fidelity, measured facts applied to THIS machine ---------------
+    // (docs/THREAT-MODEL.md#capture-fidelity is the source for these.)
+    println!("\ncapture fidelity (what a capture here would include or miss)");
+    match probe_version("node", &["--version"]) {
+        Some(v) => {
+            let major: u32 = v
+                .trim_start_matches('v')
+                .split('.')
+                .next()
+                .and_then(|m| m.parse().ok())
+                .unwrap_or(0);
+            if major >= 24 {
+                ok(&format!(
+                    "Node {v}: honors the proxy via NODE_USE_ENV_PROXY - Node/npx servers capture"
+                ));
+            } else {
+                warn(&format!(
+                    "Node {v}: ignores proxy env vars (NODE_USE_ENV_PROXY needs Node 24+), so a \
+                     capture here will MISS a Node server's own egress - it can look quiet while \
+                     talking. Upgrade Node to capture it."
+                ));
+            }
+        }
+        None => warn("Node: not found - npx-launched servers cannot run at all here"),
+    }
+    if cfg!(target_os = "macos") {
+        warn(
+            "macOS system python3 ignores SSL_CERT_FILE (LibreSSL), so a python server using it \
+             fails TLS through the proxy and its egress is MISSED. Use a python.org/homebrew \
+             Python for python servers.",
+        );
+    }
+    println!(
+        "  [info]    capture relies on servers honoring proxy env vars; a client that opens raw\n\
+         \x20           sockets or pins certs escapes it (docs/THREAT-MODEL.md). Quiet is never proof."
+    );
+
+    // --- verdictless wrap-up ------------------------------------------------------
+    let next = if blockers > 0 {
+        "fix the [missing] items above, then re-run `gurgl doctor`"
+    } else if cfg.servers.is_empty() {
+        "gurgl discover --import"
+    } else if captures == 0 {
+        "gurgl watch --all"
+    } else {
+        "gurgl watch --all --diff   (the drift audit)"
+    };
+    println!("\nnext: {next}");
+    Ok(if blockers > 0 { 1 } else { 0 })
+}
+
+/// Run `bin --version`-style probe, first line of stdout.
+fn probe_version(bin: &str, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new(bin).args(args).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout);
+    let line = s.lines().next()?.trim().to_string();
+    (!line.is_empty()).then_some(line)
+}
+
+/// `gurgl explain`: the latest capture (or one host) narrated in sentences.
+/// Every claim stays inside what was observed; the caveats travel with it.
+fn cmd_explain(store: &Store, server: &str, host: Option<&str>) -> Result<()> {
+    let version = store
+        .latest(server)?
+        .with_context(|| format!("no captures for '{server}' - run `gurgl watch {server}`"))?;
+    let snap = store.load(server, &version)?;
+    let acks = store.acks(server)?;
+    let times = if snap.trials == 1 {
+        "once".to_string()
+    } else {
+        format!("{} separate times", snap.trials)
+    };
+
+    if let Some(name) = host {
+        let h = snap
+            .hosts
+            .iter()
+            .find(|h| h.name == name)
+            .with_context(|| {
+                format!(
+                    "'{name}' was not observed in {server}@{version} (see `gurgl show {server}`)"
+                )
+            })?;
+        println!("{name} (observed in {}@{})\n", snap.server, snap.version);
+        println!("{}", host_story(h, snap.trials, &acks));
+        println!(
+            "\nWhat this cannot tell you: what was SENT to it (gurgl records host names, never\n\
+             payloads), or anything about runs outside this flight plan."
+        );
+        return Ok(());
+    }
+
+    // Whole-snapshot narration.
+    println!("{}@{} in plain language\n", snap.server, snap.version);
+    println!(
+        "gurgl ran {server} {times}, each inside a sandbox whose traffic passes through a\n\
+         local capture proxy, driving the same scripted MCP session every time (flight plan\n\
+         {}). Every host the process contacted was recorded.\n",
+        snap.flightplan
+    );
+    if snap.hosts.is_empty() {
+        println!(
+            "No hosts were observed. That means: under THIS scripted session, on this machine,\n\
+             nothing was seen - not that the server never talks. A tool that only reaches out\n\
+             on specific inputs needs a flight plan that provides them (docs/USAGE.md)."
+        );
+        return Ok(());
+    }
+    println!(
+        "It contacted {} host(s) across those runs:\n",
+        snap.hosts.len()
+    );
+    for h in &snap.hosts {
+        println!("{}\n", indent(&host_story(h, snap.trials, &acks), "  "));
+    }
+    let scrutiny: Vec<&model::Host> = snap
+        .hosts
+        .iter()
+        .filter(|h| {
+            h.class.needs_scrutiny()
+                && h.reproducibility == model::Reproducibility::Stable
+                && !acks.iter().any(|a| a.host == h.name)
+        })
+        .collect();
+    if scrutiny.is_empty() {
+        println!(
+            "Nothing here needs scrutiny right now: every stable host either matched a known\n\
+             rule or was already acknowledged by you."
+        );
+    } else {
+        println!(
+            "The part deserving your attention: {}. Reproducible, and no rule explains {}.\n\
+             `gurgl diff {server}` after the next update shows if anything NEW appears.",
+            scrutiny
+                .iter()
+                .map(|h| h.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            if scrutiny.len() == 1 { "it" } else { "them" }
+        );
+    }
+    println!(
+        "\nAnd the honest limits: this is presence only, under one scripted session. gurgl\n\
+         cannot see payloads, server-side behavior, or exfiltration riding a host the tool\n\
+         legitimately uses (docs/THREAT-MODEL.md)."
+    );
+    Ok(())
+}
+
+/// One host's story in sentences: what it is, when it appeared, how reliably,
+/// and what (if anything) the user already said about it.
+fn host_story(h: &model::Host, trials: u32, acks: &[store::Ack]) -> String {
+    let phases = if h.phases.is_empty() {
+        "during the session".to_string()
+    } else {
+        format!("during {}", h.phases.join(" and "))
+    };
+    let seen = if h.reproducibility == model::Reproducibility::Stable {
+        format!("in every one of the {trials} run(s) - reproducible")
+    } else {
+        format!(
+            "in only {} of {trials} runs - NOT reproducible, which usually means server-side \
+             A/B or feature-gate noise rather than a change in the tool; gurgl deliberately \
+             does not treat it as a finding",
+            h.seen_in_trials
+        )
+    };
+    let what = match h.class {
+        model::HostClass::FirstParty => {
+            "a domain you declared as first-party for this server".to_string()
+        }
+        model::HostClass::Telemetry => "a known analytics/crash-reporting vendor".to_string(),
+        model::HostClass::TelemetryNamed => {
+            "a host that NAMES itself telemetry but matches no known vendor - a hostname is \
+             chosen by whoever registers it, so treat this like an unknown"
+                .to_string()
+        }
+        model::HostClass::Registry => {
+            "a package registry / code host (expected when a server is launched via npx or \
+             uvx, which download the package at start)"
+                .to_string()
+        }
+        model::HostClass::Unknown => "a host matching no known rule".to_string(),
+    };
+    let ack = acks
+        .iter()
+        .find(|a| a.host == h.name)
+        .map(|a| {
+            format!(
+                "\nYou acknowledged this host on {}{}.",
+                a.date,
+                a.note
+                    .as_deref()
+                    .map(|n| format!(": \"{n}\""))
+                    .unwrap_or_default()
+            )
+        })
+        .unwrap_or_default();
+    format!("{} - {what}. Seen {seen}, {phases}.{ack}", h.name)
+}
+
+fn indent(s: &str, pad: &str) -> String {
+    s.lines()
+        .map(|l| format!("{pad}{l}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Record, list, or remove host acknowledgements. Wording is deliberate

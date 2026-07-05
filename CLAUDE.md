@@ -118,7 +118,7 @@ Path helpers live in `config.rs` (`gurgl_home()`, `default_config_path()`,
 - Errors: `anyhow` in `main`/commands, plain `Result` with `.context(...)` in
   library code. User-facing errors should say what to do next.
 - Exit codes are a documented contract: 0 = ok/no drift, 1 = drift
-  (`diff --check`, `watch --diff`), 2 = error. `run()` returns the code; don't
+  (`diff --check`, `watch --diff`) or blocked (`doctor`), 2 = error. `run()` returns the code; don't
   add new nonzero meanings casually. `--json` outputs carry a versioned
   `schema` field (`gurgl.diff/1` ...) - breaking a schema needs a version bump.
   The drift gate (`drift_hosts` in main.rs) honors acks and never counts

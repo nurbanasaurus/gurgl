@@ -5,7 +5,7 @@ first ([INSTALL.md](INSTALL.md)), then read this top to bottom once.
 
 - [Mental model](#mental-model)
 - [Global flags & config discovery](#global-flags--config-discovery)
-- [Commands](#commands): [bare gurgl / demo](#gurgl-bare-and-gurgl-demo) · [init](#gurgl-init) · [discover](#gurgl-discover) · [list](#gurgl-list) · [show](#gurgl-show) · [watch](#gurgl-watch) · [diff](#gurgl-diff) · [allow](#gurgl-allow) · [update](#gurgl-update)
+- [Commands](#commands): [bare gurgl / demo](#gurgl-bare-and-gurgl-demo) · [doctor](#gurgl-doctor) · [explain](#gurgl-explain) · [init](#gurgl-init) · [discover](#gurgl-discover) · [list](#gurgl-list) · [show](#gurgl-show) · [watch](#gurgl-watch) · [diff](#gurgl-diff) · [allow](#gurgl-allow) · [update](#gurgl-update)
 - [The config file](#the-config-file-gurgltoml)
 - [Flight plans](#flight-plans)
 - [Host classification](#host-classification)
@@ -61,6 +61,27 @@ progress from your current state.
 no mitmproxy, sandbox, or Node required. It teaches the three readings that
 matter: a known-vendor telemetry host, a stable unknown host (the signal), and
 an intermittent host the reproduction gate deliberately keeps quiet about.
+
+### `gurgl doctor`
+
+A read-only readiness and fidelity report for this machine: config and PATH
+state, capture backends (sandbox, mitmproxy, lab CA), whether each configured
+server's launch command resolves, and - the part nothing else tells you - what a
+capture HERE would include or miss, with the measured reasons (e.g. "Node 22
+ignores proxy env vars, so a Node server's egress is MISSED - it can look quiet
+while talking"; the macOS system-python TLS caveat). Everything is phrased as
+coverage, never as a safety verdict. Ends with the one next command for your
+state. Exits 1 when something would block `gurgl watch`, so setup scripts can
+gate on it.
+
+### `gurgl explain`
+
+`gurgl explain <server> [host]` - the latest capture narrated in plain
+sentences instead of a table: what gurgl actually did, each host with what it
+is, when it appeared and how reproducibly, which hosts deserve attention (with
+your acks woven in: "You acknowledged this host on ... : reason"), and the
+honest limits attached. With a host argument it focuses on that one host. Reads
+the store only - no capture backends needed.
 
 ### `gurgl init`
 

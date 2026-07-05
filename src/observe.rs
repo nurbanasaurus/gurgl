@@ -845,7 +845,7 @@ fn sanitize(s: &str) -> String {
         .collect()
 }
 
-fn on_path(bin: &str) -> bool {
+pub(crate) fn on_path(bin: &str) -> bool {
     if bin.contains('/') {
         return std::path::Path::new(bin).is_file();
     }

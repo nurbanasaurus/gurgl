@@ -290,6 +290,8 @@ Working from a source clone instead? `make update` (git pull + reinstall) and
 |---------|--------------|
 | `gurgl` (bare) | Orientation: config/server/capture status and the one next command. |
 | `gurgl demo` | Annotated example diff on bundled data - no deps needed. |
+| `gurgl doctor` | Readiness + capture-fidelity report for this machine; exits 1 if `watch` would be blocked. |
+| `gurgl explain <server> [host]` | The latest capture narrated in plain language, acks woven in. |
 | `gurgl init` | Create `~/.gurgl` (config, default flight plan, store). |
 | `gurgl discover [--import]` | Find MCP servers on this machine (with enabled/bundled status); `--import` adds the stdio ones to `gurgl.toml`. |
 | `gurgl list` | List captured servers and versions. |

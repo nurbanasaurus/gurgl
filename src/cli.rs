@@ -148,4 +148,17 @@ pub enum Commands {
         #[arg(long)]
         clear: bool,
     },
+
+    /// Check this machine's readiness and capture fidelity: what works, what is
+    /// missing, what a capture here would miss and why. Read-only. Exits 1 if
+    /// something would block `gurgl watch`.
+    Doctor,
+
+    /// Narrate a capture (or one host) in plain language: what gurgl did, what
+    /// it saw, what deserves attention - and what none of it proves.
+    Explain {
+        server: String,
+        /// Explain just this observed host.
+        host: Option<String>,
+    },
 }

@@ -19,7 +19,7 @@ mod sandbox;
 mod store;
 
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use anyhow::{bail, Context, Result};
@@ -57,11 +57,15 @@ fn run() -> Result<i32> {
 
     let cfg = load_config(&cli)?;
     let store = build_store(&cli, &cfg)?;
+    // The config path actually resolved (honors --config), so orient/doctor
+    // report and gate on the same file load_config read - not a re-derivation
+    // that ignores --config.
+    let cfg_source = config_source(&cli);
 
     match &cli.command {
         // Bare `gurgl`: a git-status-style orientation beats generic help. It
         // shows where this machine stands and the one next command that helps.
-        None => cmd_orient(&cfg, &store).map(|_| 0),
+        None => cmd_orient(&cfg, &store, cfg_source.as_deref()).map(|_| 0),
         Some(Commands::Update) => unreachable!("handled above"),
         Some(Commands::Init) => cmd_init(&store).map(|_| 0),
         Some(Commands::List) => cmd_list(&store, cli.json).map(|_| 0),
@@ -104,7 +108,9 @@ fn run() -> Result<i32> {
             *until_closed,
             *diff,
         ),
-        Some(Commands::Discover { import }) => cmd_discover(*import, cli.json).map(|_| 0),
+        Some(Commands::Discover { import }) => {
+            cmd_discover(*import, cli.json, &import_target(&cli)).map(|_| 0)
+        }
         Some(Commands::Demo) => cmd_demo().map(|_| 0),
         Some(Commands::Ack {
             server,
@@ -126,7 +132,7 @@ fn run() -> Result<i32> {
             version,
             clear,
         }) => cmd_accept(&store, server, version.as_deref(), *clear).map(|_| 0),
-        Some(Commands::Doctor) => cmd_doctor(&cfg, &store),
+        Some(Commands::Doctor) => cmd_doctor(&cfg, &store, cfg_source.as_deref()),
         Some(Commands::Explain { server, host }) => {
             cmd_explain(&store, server, host.as_deref()).map(|_| 0)
         }
@@ -140,20 +146,11 @@ const DEMO_TO: &str = include_str!("../examples/snapshots/example-mcp/1.3.0.json
 
 /// Bare `gurgl`: where this machine stands and the single next command that
 /// makes progress. States it never asserts: nothing here is a safety judgment.
-fn cmd_orient(cfg: &Config, store: &Store) -> Result<()> {
+fn cmd_orient(cfg: &Config, store: &Store, cfg_path: Option<&Path>) -> Result<()> {
     println!("gurgl - local-first egress hygiene for MCP servers\n");
 
-    // Config: same discovery order load_config used.
-    let local = PathBuf::from("gurgl.toml");
-    let home_cfg = config::default_config_path();
-    let cfg_path = if local.is_file() {
-        Some(local)
-    } else if home_cfg.is_file() {
-        Some(home_cfg)
-    } else {
-        None
-    };
-    match &cfg_path {
+    // Config: the path load_config actually resolved (honors --config).
+    match cfg_path {
         Some(p) => println!("  config     {}", p.display()),
         None => println!("  config     none yet"),
     }
@@ -299,21 +296,33 @@ fn cmd_demo() -> Result<()> {
     Ok(())
 }
 
-fn load_config(cli: &Cli) -> Result<Config> {
-    // Precedence: explicit --config, then a project-local ./gurgl.toml, then the
-    // home install at ~/.gurgl/gurgl.toml, then built-in defaults.
-    let path = cli.config.clone().or_else(|| {
+/// The config file `load_config` will read, by precedence: explicit --config,
+/// then a project-local ./gurgl.toml, then ~/.gurgl/gurgl.toml. `None` means no
+/// file was found and built-in defaults are used. Shared so `doctor`/`orient`
+/// report the SAME path that is actually loaded, honoring --config.
+fn config_source(cli: &Cli) -> Option<PathBuf> {
+    cli.config.clone().or_else(|| {
         let local = PathBuf::from("gurgl.toml");
         if local.is_file() {
             return Some(local);
         }
         let home = config::default_config_path();
         home.is_file().then_some(home)
-    });
-    match path {
+    })
+}
+
+fn load_config(cli: &Cli) -> Result<Config> {
+    match config_source(cli) {
         Some(p) => Config::load(&p),
         None => Ok(Config::default()),
     }
+}
+
+/// Where `discover --import` writes: the same precedence as `config_source`, but
+/// falling back to the default path to CREATE when nothing exists yet, and
+/// honoring an explicit --config even if that file does not exist.
+fn import_target(cli: &Cli) -> PathBuf {
+    config_source(cli).unwrap_or_else(config::default_config_path)
 }
 
 fn build_store(cli: &Cli, cfg: &Config) -> Result<Store> {
@@ -523,7 +532,21 @@ fn cmd_diff(
     } else {
         match (from, to) {
             (Some(f), Some(t)) => (f.to_string(), t.to_string()),
-            _ => match store.latest_two(server)? {
+            // A lone --from diffs that version against the latest capture (a
+            // natural "what changed since f"). A lone --to is ambiguous (from
+            // what?), so ask for both rather than silently diffing the latest two
+            // and answering a different question than the one asked.
+            (Some(f), None) => {
+                let latest = store
+                    .latest(server)?
+                    .with_context(|| format!("no captures for '{server}'"))?;
+                (f.to_string(), latest)
+            }
+            (None, Some(_)) => bail!(
+                "--to needs --from; pass both versions, or give --from <v> alone to diff it \
+                 against the latest"
+            ),
+            (None, None) => match store.latest_two(server)? {
                 Some(pair) => pair,
                 None => bail!(
                     "need at least two captured versions of '{server}' to diff (or pass --from/--to)"
@@ -560,6 +583,7 @@ fn cmd_diff(
             "acknowledged_present": acked_new.iter().map(|h| &h.name).collect::<Vec<_>>(),
             "from_flightplan": from_snap.flightplan,
             "to_flightplan": to_snap.flightplan,
+            "flightplan_mismatch": from_snap.flightplan != to_snap.flightplan,
             "to_trials": to_snap.trials,
             "note": "presence only: hosts observed under this flight plan. Absence is non-coverage, not proof.",
         });
@@ -567,6 +591,16 @@ fn cmd_diff(
     } else {
         println!("{}: {} -> {}", d.server, d.from_version, d.to_version);
         println!("  unchanged hosts: {}", d.unchanged);
+        if from_snap.flightplan != to_snap.flightplan {
+            // The flight-plan fingerprint binds an observation to its method. If
+            // the two captures used different plans, added/removed hosts may
+            // reflect the changed method, not the tool - say so plainly.
+            println!(
+                "  ! flight plans differ ({} -> {}): new or missing hosts may reflect the changed \
+                 method, not the tool. Re-capture both under one plan to compare cleanly.",
+                from_snap.flightplan, to_snap.flightplan
+            );
+        }
 
         if d.added.is_empty() {
             println!("  no new hosts observed under this flight plan");
@@ -722,6 +756,13 @@ fn cmd_watch(
         } else {
             None
         };
+        // Load the pre-update snapshot CONTENT now, BEFORE capture+save can
+        // overwrite a same-version file. This is what lets `--diff` still detect
+        // drift on a same-version re-release or an "unknown"-labeled server
+        // (labels equal, contents changed) instead of dismissing it as "nothing
+        // to compare". A load failure here is per-server, never a batch abort.
+        let prev_before: Option<Result<model::Snapshot>> =
+            compare_to.as_ref().map(|v| store.load(&spec.name, v));
         match FlightPlan::load(&plan_path)
             .with_context(|| format!("loading flight plan {}", plan_path.display()))
             .and_then(|plan| observe::capture(cfg, spec, &plan, mode, monitor))
@@ -742,8 +783,9 @@ fn cmd_watch(
                 // especially for servers stuck on the "unknown" label.
                 if overwrote {
                     println!(
-                        "note: this replaced the previous capture of {}@{} (same version \
-                         label), so there is nothing new for `gurgl diff` to compare.",
+                        "note: this replaced the previous capture of {}@{} (same version label). \
+                         `gurgl diff` compares versions by label, so it can't compare two \
+                         same-labeled captures - pin distinct versions for a diffable history.",
                         snap.server, snap.version
                     );
                     if snap.version == "unknown" {
@@ -752,34 +794,73 @@ fn cmd_watch(
                              (version = \"...\") so each capture keeps its own history."
                         );
                     }
+                    if store.baseline(&snap.server).as_deref() == Some(snap.version.as_str()) {
+                        println!(
+                            "      this version is your accepted baseline; the reviewed capture \
+                             was replaced - re-review with `gurgl diff {} --baseline`.",
+                            snap.server
+                        );
+                    }
                 }
                 captured += 1;
 
-                // The audit line for this server, against baseline/previous.
+                // The audit line for this server, comparing the fresh capture's
+                // CONTENT against the pre-update content (loaded before save), so
+                // a same-version overwrite is still diffed, not dismissed. Store
+                // errors here are per-server notes, never a batch abort.
                 if audit {
-                    match compare_to {
-                        Some(prev) if prev != snap.version => {
-                            let prev_snap = store.load(&snap.server, &prev)?;
+                    let prev_label = compare_to.as_deref().unwrap_or("?");
+                    match prev_before {
+                        None => drift_lines.push(format!(
+                            "  {:<16} first capture - baseline recorded, nothing to compare yet",
+                            snap.server
+                        )),
+                        Some(Err(e)) => drift_lines.push(format!(
+                            "  {:<16} could not compare against {prev_label}: {e:#} - re-run \
+                             `gurgl accept {}` or inspect the store",
+                            snap.server, snap.server
+                        )),
+                        Some(Ok(prev_snap)) => {
                             let d = diff::diff(&prev_snap, &snap);
-                            let acked: Vec<String> = store
-                                .acks(&snap.server)?
-                                .into_iter()
-                                .map(|a| a.host)
-                                .collect();
+                            let acked: Vec<String> = match store.acks(&snap.server) {
+                                Ok(a) => a.into_iter().map(|a| a.host).collect(),
+                                Err(e) => {
+                                    drift_lines.push(format!(
+                                        "  {:<16} acks unreadable ({e:#}); comparing without them",
+                                        snap.server
+                                    ));
+                                    Vec::new()
+                                }
+                            };
+                            let fp_note = if prev_snap.flightplan != snap.flightplan {
+                                "  [flight plans differ - method changed, not necessarily the tool]"
+                            } else {
+                                ""
+                            };
                             let scrutiny = drift_hosts(&d, "unknown", &acked);
                             let stable_new = d.stable_added().len();
                             if scrutiny.is_empty() {
-                                drift_lines.push(format!(
-                                    "  {:<16} {} -> {}: {} new stable host(s), none needing scrutiny",
-                                    snap.server, prev, snap.version, stable_new
-                                ));
+                                if prev_label == snap.version
+                                    && d.added.is_empty()
+                                    && d.removed.is_empty()
+                                {
+                                    drift_lines.push(format!(
+                                        "  {:<16} same version re-capture, no change in observed hosts{fp_note}",
+                                        snap.server
+                                    ));
+                                } else {
+                                    drift_lines.push(format!(
+                                        "  {:<16} {} -> {}: {} new stable host(s), none needing scrutiny{fp_note}",
+                                        snap.server, prev_label, snap.version, stable_new
+                                    ));
+                                }
                             } else {
                                 drifted = true;
                                 drift_lines.push(format!(
                                     "  {:<16} {} -> {}: {} new stable host(s) NEED SCRUTINY: {} \
-                                     (gurgl diff {})",
+                                     (gurgl diff {}){fp_note}",
                                     snap.server,
-                                    prev,
+                                    prev_label,
                                     snap.version,
                                     scrutiny.len(),
                                     scrutiny.join(", "),
@@ -787,14 +868,6 @@ fn cmd_watch(
                                 ));
                             }
                         }
-                        Some(_) => drift_lines.push(format!(
-                            "  {:<16} same version label - nothing to compare",
-                            snap.server
-                        )),
-                        None => drift_lines.push(format!(
-                            "  {:<16} first capture - baseline recorded, nothing to compare yet",
-                            snap.server
-                        )),
                     }
                 }
             }
@@ -847,7 +920,7 @@ fn cmd_watch(
 /// Read-only; runs nothing but version probes. Every finding is phrased as
 /// coverage ("a capture here will include/miss X because Y"), never as a
 /// safety verdict. Exits 1 when something would block `gurgl watch`.
-fn cmd_doctor(cfg: &Config, store: &Store) -> Result<i32> {
+fn cmd_doctor(cfg: &Config, store: &Store, cfg_path: Option<&Path>) -> Result<i32> {
     let mut blockers = 0usize;
     let ok = |s: &str| println!("  [ok]      {s}");
     let warn = |s: &str| println!("  [warn]    {s}");
@@ -857,15 +930,14 @@ fn cmd_doctor(cfg: &Config, store: &Store) -> Result<i32> {
 
     // --- setup ----------------------------------------------------------------
     println!("setup");
-    let local = PathBuf::from("gurgl.toml");
-    let home_cfg = config::default_config_path();
-    if local.is_file() {
-        ok(&format!("config: ./{} (project-local)", local.display()));
-    } else if home_cfg.is_file() {
-        ok(&format!("config: {}", home_cfg.display()));
-    } else {
-        blockers += 1;
-        missing("config: none found - run `gurgl init`");
+    // The path load_config resolved, honoring --config - not a re-derivation
+    // that would falsely report "none found" for `gurgl -c <path> doctor`.
+    match cfg_path {
+        Some(p) => ok(&format!("config: {}", p.display())),
+        None => {
+            blockers += 1;
+            missing("config: none found - run `gurgl init`");
+        }
     }
     if cfg.servers.is_empty() {
         warn("servers: none configured - run `gurgl discover --import` or edit gurgl.toml");
@@ -1202,11 +1274,21 @@ fn cmd_ack(
         return Ok(());
     }
 
+    // You acknowledge a host you SAW in a capture. Requiring at least one
+    // capture stops a typo'd server name from silently creating an orphan
+    // acks.toml that no diff will ever consult.
+    let latest = store.latest(server)?;
+    if latest.is_none() {
+        bail!(
+            "no captures for '{server}' - nothing to acknowledge (typo? run `gurgl list` to see \
+             captured servers, or `gurgl watch {server}` first)"
+        );
+    }
     let ack = store::Ack {
         host: host.to_string(),
         note: note.map(String::from),
         date: today(),
-        reviewed_at_version: store.latest(server)?,
+        reviewed_at_version: latest,
     };
     let replaced = store.add_ack(server, ack)?;
     println!(
@@ -1292,7 +1374,7 @@ fn parse_hold(s: &str) -> Result<std::time::Duration> {
     Ok(std::time::Duration::from_secs(n * mult))
 }
 
-fn cmd_discover(import: bool, json: bool) -> Result<()> {
+fn cmd_discover(import: bool, json: bool, target: &Path) -> Result<()> {
     let found = discover::discover();
     if json {
         // Inventory as data; --import still requires the human-readable mode.
@@ -1412,7 +1494,7 @@ fn cmd_discover(import: bool, json: bool) -> Result<()> {
         println!("\nnothing to import: no directly-runnable stdio servers found.");
         return Ok(());
     }
-    import_servers(&runnable)
+    import_servers(&runnable, target)
 }
 
 /// Whether a server's launch references a client-provided runtime variable (e.g.
@@ -1422,45 +1504,78 @@ fn references_client_runtime(d: &discover::Discovered) -> bool {
     d.command.as_deref().map(has_var).unwrap_or(false) || d.args.iter().any(|a| has_var(a))
 }
 
-/// Append discovered stdio servers to gurgl.toml, skipping any already present.
-fn import_servers(stdio: &[&discover::Discovered]) -> Result<()> {
-    let path = config::default_config_path();
+/// Append discovered stdio servers to the resolved config file, skipping any
+/// already present. Reports what was imported and what was skipped (by name and
+/// source) so the human review the acks/baseline model depends on starts from
+/// accurate information.
+fn import_servers(stdio: &[&discover::Discovered], path: &Path) -> Result<()> {
     if !path.exists() {
-        let home = config::gurgl_home();
-        std::fs::create_dir_all(&home)
-            .with_context(|| format!("creating gurgl home {}", home.display()))?;
-        std::fs::write(&path, Config::template())
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        std::fs::write(path, Config::template())
             .with_context(|| format!("writing {}", path.display()))?;
         println!("\ncreated {}", path.display());
     }
 
-    let mut names: std::collections::HashSet<String> = Config::load(&path)
-        .map(|c| c.servers.into_iter().map(|s| s.name).collect())
-        .unwrap_or_default();
+    // If the target exists but does not parse, STOP. Appending to a broken config
+    // (the old unwrap_or_default) silently duplicates servers and grows the mess;
+    // tell the user to fix it first.
+    let existing = Config::load(path).with_context(|| {
+        format!(
+            "{} exists but does not parse - fix it before importing",
+            path.display()
+        )
+    })?;
+    let mut names: std::collections::HashSet<String> =
+        existing.servers.iter().map(|s| s.name.clone()).collect();
 
     let mut text =
-        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    let mut added = 0;
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let mut imported: Vec<(String, String)> = Vec::new();
+    let mut skipped: Vec<(String, String)> = Vec::new();
     for d in stdio {
         if !names.insert(d.name.clone()) {
-            continue; // already configured, or a duplicate across client configs
+            // Name already present (in the config, or an earlier candidate with
+            // this name). Do not silently pick one command over another - list it.
+            skipped.push((d.name.clone(), d.source.clone()));
+            continue;
         }
         if !text.ends_with('\n') {
             text.push('\n');
         }
         text.push_str(&discover::to_toml_block(d));
-        added += 1;
+        imported.push((d.name.clone(), d.source.clone()));
     }
 
-    if added == 0 {
+    if imported.is_empty() {
         println!(
             "\nall discovered stdio servers are already in {}.",
             path.display()
         );
         return Ok(());
     }
-    std::fs::write(&path, &text).with_context(|| format!("writing {}", path.display()))?;
-    println!("\nimported {added} server(s) into {}.", path.display());
+    // Atomic replace so a crash/ENOSPC can't truncate the config file.
+    store::write_atomic(path, text.as_bytes())?;
+    println!(
+        "\nimported {} server(s) into {}:",
+        imported.len(),
+        path.display()
+    );
+    for (name, source) in &imported {
+        println!("  {name:<24} (from {source})");
+    }
+    if !skipped.is_empty() {
+        println!(
+            "\nnot imported ({} name(s) already present - if a different command was expected, \
+             rename or edit gurgl.toml):",
+            skipped.len()
+        );
+        for (name, source) in &skipped {
+            println!("  {name:<24} (also seen from {source})");
+        }
+    }
     println!("run `gurgl watch` to capture them all, or `gurgl watch <name>` for one.");
     Ok(())
 }

@@ -111,6 +111,13 @@ fn squid(snapshot: &Snapshot, hosts: &[&Host]) -> String {
         snapshot.server, snapshot.version, snapshot.flightplan, snapshot.trials
     ));
     out.push_str(&format!("# {CAVEAT}\n"));
+    if hosts.is_empty() {
+        // Emitting `http_access allow {acl}` with no `acl ... dstdomain` lines
+        // references an undefined ACL and squid rejects the whole config. With
+        // nothing stable to allow, say so in a comment and emit no rule.
+        out.push_str("# no stable hosts observed under this flight plan - nothing to allow.\n");
+        return out;
+    }
     for h in hosts {
         out.push_str(&format!("acl {acl} dstdomain {}\n", h.name));
     }
@@ -133,4 +140,41 @@ fn sanitize(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Host, HostClass, Reproducibility, Snapshot};
+
+    fn snap(hosts: Vec<Host>) -> Snapshot {
+        Snapshot {
+            server: "s".into(),
+            version: "1".into(),
+            captured_at: 0,
+            trials: 5,
+            flightplan: "fp".into(),
+            gurgl_version: "0".into(),
+            hosts,
+        }
+    }
+
+    #[test]
+    fn squid_with_no_stable_hosts_is_valid_config() {
+        // Only an intermittent host: nothing stable to allow. The output must not
+        // reference an undefined ACL (squid rejects the whole file otherwise).
+        let s = snap(vec![Host {
+            name: "flaky.example".into(),
+            class: HostClass::Unknown,
+            reproducibility: Reproducibility::Intermittent,
+            seen_in_trials: 2,
+            phases: vec![],
+        }]);
+        let out = allowlist(&s, Format::Squid);
+        assert!(
+            !out.contains("http_access allow"),
+            "must not emit an allow rule referencing an undefined ACL"
+        );
+        assert!(out.contains("nothing to allow"));
+    }
 }

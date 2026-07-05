@@ -46,6 +46,30 @@ fn safe_key(kind: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Write `contents` to `path` atomically: write a sibling temp file, then rename
+/// over the target (atomic on the same filesystem, on Linux and macOS). A crash,
+/// a SIGKILL (the second-Ctrl-C force-quit path is exactly this), or an ENOSPC
+/// mid-write then leaves the previous good file intact rather than a truncated
+/// half-written snapshot/sidecar. Plain `fs::write` truncates in place first.
+pub(crate) fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("gurgl");
+    let tmp = dir.join(format!(
+        ".{name}.tmp.{}.{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::write(&tmp, contents).with_context(|| format!("writing {}", tmp.display()))?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("renaming into {}", path.display()));
+    }
+    Ok(())
+}
+
 /// One acknowledged host: the user reviewed it and recorded why. Wording is
 /// deliberate - "acknowledged", never "approved" or "safe".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,7 +127,7 @@ impl Store {
             .with_context(|| format!("creating snapshot dir {}", dir.display()))?;
         let path = dir.join(format!("{}.json", snap.version));
         let json = serde_json::to_string_pretty(snap).context("serializing snapshot")?;
-        std::fs::write(&path, json).with_context(|| format!("writing {}", path.display()))?;
+        write_atomic(&path, json.as_bytes())?;
         Ok(path)
     }
 
@@ -158,12 +182,19 @@ impl Store {
                 .and_then(|s| s.to_str())
                 .unwrap_or_default()
                 .to_string();
-            // Read captured_at to order; fall back to 0 if unreadable.
-            let captured_at = self
-                .load(server, &version)
-                .map(|s| s.captured_at)
-                .unwrap_or(0);
-            items.push((captured_at, version));
+            // Order by captured_at. A corrupt/unreadable snapshot must NOT
+            // silently become captured_at 0 (sorted oldest) and thereby shift
+            // which version `latest()` returns: surface it on stderr and exclude
+            // it from ordering entirely (it can't be shown or diffed anyway).
+            match self.load(server, &version) {
+                Ok(s) => items.push((s.captured_at, version)),
+                Err(e) => {
+                    eprintln!(
+                        "warning: skipping unreadable snapshot {}: {e:#}",
+                        path.display()
+                    );
+                }
+            }
         }
         items.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
         Ok(items.into_iter().map(|(_, v)| v).collect())
@@ -243,7 +274,7 @@ impl Store {
              # diff reports acknowledged hosts quietly instead of re-alerting.\n\n{}",
             toml::to_string_pretty(&file).context("serializing acks")?
         );
-        std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))
+        write_atomic(&path, text.as_bytes())
     }
 
     // ---- reviewed baseline (baseline sidecar) --------------------------------
@@ -275,12 +306,7 @@ impl Store {
         }
         let path = self.baseline_path(server);
         match version {
-            Some(v) => {
-                std::fs::create_dir_all(path.parent().unwrap())
-                    .with_context(|| format!("creating {}", path.parent().unwrap().display()))?;
-                std::fs::write(&path, format!("{v}\n"))
-                    .with_context(|| format!("writing {}", path.display()))
-            }
+            Some(v) => write_atomic(&path, format!("{v}\n").as_bytes()),
             None => {
                 if path.exists() {
                     std::fs::remove_file(&path)

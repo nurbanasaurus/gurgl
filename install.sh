@@ -73,13 +73,26 @@ if [ "$MODIFY_PATH" -eq 1 ]; then
     fish) profiles="" ;;  # fish uses its own path handling; instruct below
     *)    profiles="$HOME/.profile" ;;
   esac
+  handled=0
   for p in $profiles; do
-    touch "$p"
-    if ! grep -qF '.gurgl/env' "$p" 2>/dev/null; then
+    # Only append to a profile that ALREADY exists. Creating ~/.bash_profile
+    # would silently shadow ~/.profile for bash login shells (the default
+    # Debian/Ubuntu skeleton ships only ~/.profile, which sources ~/.bashrc).
+    [ -f "$p" ] || continue
+    handled=1
+    # Dedupe on the EXACT expanded line we append, so a custom GURGL_HOME (which
+    # need not contain ".gurgl") still matches and re-runs never append a copy.
+    if ! grep -qF "$GURGL_HOME/env" "$p" 2>/dev/null; then
       printf '\n. "%s/env"\n' "$GURGL_HOME" >> "$p"
       PROFILE_TOUCHED="$PROFILE_TOUCHED $p"
     fi
   done
+  # No target profile existed (fresh account): create the conventional
+  # ~/.profile rather than a shell-specific file that could shadow it.
+  if [ "$handled" -eq 0 ] && [ -n "$profiles" ]; then
+    printf '\n. "%s/env"\n' "$GURGL_HOME" >> "$HOME/.profile"
+    PROFILE_TOUCHED="$PROFILE_TOUCHED $HOME/.profile"
+  fi
 fi
 
 # 3c. create ~/.gurgl/gurgl.toml + the default flight plan so `gurgl watch` has

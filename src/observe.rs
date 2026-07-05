@@ -51,13 +51,16 @@ mod interrupt {
     /// one and take the hard-exit path below.
     static SIGINTS: AtomicU32 = AtomicU32::new(0);
 
-    extern "C" fn on_signal(_sig: libc::c_int) {
+    extern "C" fn on_signal(sig: libc::c_int) {
         // Only async-signal-safe operations here: atomics, write(), tcsetattr(),
         // signal(), raise().
         STOP.store(true, Ordering::SeqCst);
-        if SIGINTS.fetch_add(1, Ordering::SeqCst) >= 1 {
-            // Second Ctrl-C: force quit. Best-effort terminal restore first so
-            // the shell is not left on the alternate screen in raw mode.
+        // SIGTERM/SIGHUP request the same clean stop as a first Ctrl-C: the
+        // capture loop notices STOP at its next boundary, tears down (restoring
+        // the terminal and reaping mitmdump/the server via Drop), and saves what
+        // completed. Only SIGINT keeps the double-Ctrl-C hard-exit escape hatch,
+        // for when teardown itself wedges.
+        if sig == libc::SIGINT && SIGINTS.fetch_add(1, Ordering::SeqCst) >= 1 {
             crate::report::emergency_restore();
             unsafe {
                 libc::signal(libc::SIGINT, libc::SIG_DFL);
@@ -66,10 +69,16 @@ mod interrupt {
         }
     }
 
-    /// Install the SIGINT handler (idempotent enough to call once per watch).
+    /// Install the stop handler for SIGINT and, crucially, SIGTERM/SIGHUP too.
+    /// Without the latter, `kill`/terminal-close take the default terminate path
+    /// with no Drop and no teardown, leaving the tty on the alternate screen in
+    /// raw mode and orphaning mitmdump and the sandboxed server.
     pub fn install() {
         unsafe {
-            libc::signal(libc::SIGINT, on_signal as *const () as usize);
+            let handler = on_signal as *const () as usize;
+            libc::signal(libc::SIGINT, handler);
+            libc::signal(libc::SIGTERM, handler);
+            libc::signal(libc::SIGHUP, handler);
         }
     }
 
@@ -338,11 +347,44 @@ pub fn capture(
 
 /// Kill (and reap) a child when this guard drops, so an early return mid-trial
 /// never leaks a mitmdump or server process.
-struct KillOnDrop(Child);
+/// Kill (and reap) a child when this guard drops, so an early return mid-trial
+/// never leaks a mitmdump or server process. When `group` is set (the sandboxed
+/// server, which pre_exec'd into its own process group), SIGKILL the whole group
+/// first: on macOS sandbox-exec execs the launcher in-process and the real MCP
+/// server runs as a grandchild that a single-PID kill would orphan. On
+/// Linux/bwrap `--die-with-parent` + `--unshare-pid` already tear down the tree,
+/// so the group kill is a harmless belt-and-suspenders there.
+struct KillOnDrop {
+    child: Child,
+    group: bool,
+}
+
+impl KillOnDrop {
+    fn direct(child: Child) -> Self {
+        Self {
+            child,
+            group: false,
+        }
+    }
+    fn group(child: Child) -> Self {
+        Self { child, group: true }
+    }
+}
+
 impl Drop for KillOnDrop {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        #[cfg(unix)]
+        if self.group {
+            // The child is a group leader (setpgid(0,0) in pre_exec), so its pid
+            // is the pgid; a negative target signals the whole group, catching
+            // grandchildren the direct kill below would miss.
+            let pid = self.child.id() as libc::pid_t;
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -460,7 +502,7 @@ fn run_trial(
     // last lines are the diagnosis. Discarding them (the old Stdio::null) is
     // what made proxy failure invisible.
     let proxy_stderr_tail = drain_stderr_tail(proxy_child.stderr.take());
-    let mut proxy_guard = KillOnDrop(proxy_child);
+    let mut proxy_guard = KillOnDrop::direct(proxy_child);
 
     wait_for_port(port, Duration::from_secs(20))
         .with_context(|| proxy_start_failure(&proxy_stderr_tail))?;
@@ -492,29 +534,41 @@ fn run_trial(
             cmd.env(k, v);
         }
     }
-    let server = cmd
-        .envs(penv.vars())
+    cmd.envs(penv.vars())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    // Put the sandboxed server in its own process group so KillOnDrop::group can
+    // reap the whole tree - on macOS, sandbox-exec runs the real server as a
+    // grandchild a single-PID kill would orphan. setpgid is async-signal-safe,
+    // as pre_exec requires.
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(|| {
+            libc::setpgid(0, 0);
+            Ok(())
+        });
+    }
+    let server = cmd
         .spawn()
         .with_context(|| format!("spawning sandboxed '{}'", spec.command))?;
-    let mut server_guard = KillOnDrop(server);
+    let mut server_guard = KillOnDrop::group(server);
 
     // Take the pipes (guard already owns the child, so a failure here still kills it).
     let mut stdin = server_guard
-        .0
+        .child
         .stdin
         .take()
         .context("server stdin unavailable")?;
     let stdout = server_guard
-        .0
+        .child
         .stdout
         .take()
         .context("server stdout unavailable")?;
     // Keep the tail of the server's stderr (drained so the pipe never blocks):
     // when the server dies mid-capture, its last lines are the diagnosis.
-    let stderr_tail = drain_stderr_tail(server_guard.0.stderr.take());
+    let stderr_tail = drain_stderr_tail(server_guard.child.stderr.take());
     let rx = spawn_line_reader(stdout);
 
     // --- drive the flight plan, marking when each phase begins ---
@@ -543,10 +597,10 @@ fn run_trial(
         // their stderr tail, never a false-clean snapshot. Hold mode's softer
         // server exit is allowed only later, in the monitor phase, once the
         // scripted plan has actually run.
-        if let Ok(Some(status)) = server_guard.0.try_wait() {
+        if let Ok(Some(status)) = server_guard.child.try_wait() {
             bail!("{}", dead_server_msg(&status, &step.phase, &stderr_tail));
         }
-        check_proxy_alive(&mut proxy_guard.0, &step.phase, &proxy_stderr_tail)?;
+        check_proxy_alive(&mut proxy_guard.child, &step.phase, &proxy_stderr_tail)?;
         phase_marks.push((now_epoch(), step.phase.clone()));
         reporter.phase(&step.phase);
         match step.action.as_str() {
@@ -613,9 +667,9 @@ fn run_trial(
     if !stop_requested() {
         // A dead proxy at the end means the flows we hold may be incomplete, in
         // any mode - never save that as a snapshot.
-        check_proxy_alive(&mut proxy_guard.0, last_phase, &proxy_stderr_tail)?;
+        check_proxy_alive(&mut proxy_guard.child, last_phase, &proxy_stderr_tail)?;
         if matches!(monitor, Monitor::Battery) {
-            if let Ok(Some(status)) = server_guard.0.try_wait() {
+            if let Ok(Some(status)) = server_guard.child.try_wait() {
                 bail!("{}", dead_server_msg(&status, last_phase, &stderr_tail));
             }
         }
@@ -655,13 +709,13 @@ fn run_trial(
                 }
             }
             // If the server exits on its own, there is nothing left to watch.
-            if matches!(server_guard.0.try_wait(), Ok(Some(_))) {
+            if matches!(server_guard.child.try_wait(), Ok(Some(_))) {
                 reporter.note("server process exited; ending watch");
                 break;
             }
             // A dead proxy during the hold is a fidelity failure, not a normal
             // end: error out rather than keep "watching" blind.
-            check_proxy_alive(&mut proxy_guard.0, phase, &proxy_stderr_tail)?;
+            check_proxy_alive(&mut proxy_guard.child, phase, &proxy_stderr_tail)?;
             thread::sleep(Duration::from_millis(200));
             surface_hosts(
                 &flows_path,

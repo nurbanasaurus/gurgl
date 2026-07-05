@@ -67,6 +67,11 @@ pub struct Discovered {
     pub source: String,
     /// Whether the client has this server enabled, or it is just present.
     pub status: Status,
+    /// The project directory this server belongs to (a `.mcp.json`'s parent, or
+    /// a per-project key in `~/.claude.json`), used to match enable records to
+    /// the RIGHT project. Internal; not part of the --json output.
+    #[serde(skip)]
+    pub config_dir: Option<PathBuf>,
 }
 
 impl Discovered {
@@ -175,9 +180,21 @@ pub fn discover() -> Vec<Discovered> {
     out
 }
 
+/// Read a config file, refusing non-regular files and absurdly large ones. Real
+/// config files are tiny; without a cap a multi-GB (or attacker-planted) file
+/// named `.mcp.json` would OOM read_to_string.
+fn read_capped(path: &Path) -> Option<String> {
+    const CAP: u64 = 8 * 1024 * 1024; // 8 MiB - orders of magnitude over any real config
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > CAP {
+        return None;
+    }
+    std::fs::read_to_string(path).ok()
+}
+
 /// Read one JSON config file and append any MCP servers it defines.
 fn parse_file(path: &Path, label: &str, out: &mut Vec<Discovered>) {
-    let Ok(text) = std::fs::read_to_string(path) else {
+    let Some(text) = read_capped(path) else {
         return;
     };
     let Ok(json) = serde_json::from_str::<Value>(&text) else {
@@ -191,7 +208,7 @@ fn parse_file(path: &Path, label: &str, out: &mut Vec<Discovered>) {
 /// (stdio) or `url` (Streamable HTTP). A server with `enabled = false` is still
 /// listed for inventory (it is left as `Configured`, i.e. present, not on).
 fn parse_codex_file(path: &Path, out: &mut Vec<Discovered>) {
-    let Ok(text) = std::fs::read_to_string(path) else {
+    let Some(text) = read_capped(path) else {
         return;
     };
     let Ok(val) = toml::from_str::<toml::Value>(&text) else {
@@ -201,6 +218,7 @@ fn parse_codex_file(path: &Path, out: &mut Vec<Discovered>) {
         return;
     };
     let src = source("Codex", path);
+    let dir = path.parent().map(|p| p.to_path_buf());
     for (name, spec) in servers {
         let command = spec
             .get("command")
@@ -229,6 +247,7 @@ fn parse_codex_file(path: &Path, out: &mut Vec<Discovered>) {
             has_env,
             source: src.clone(),
             status: Status::Configured,
+            config_dir: dir.clone(),
         });
     }
 }
@@ -281,6 +300,12 @@ fn home_config_files() -> Vec<PathBuf> {
         }
         visited += 1;
         if visited > MAX_DIRS {
+            // Presence, not silence: a truncated scan must never read as a
+            // complete inventory (constraint #2). Say the scan stopped short.
+            eprintln!(
+                "note: config scan stopped after {MAX_DIRS} directories; the inventory may be \
+                 incomplete (configs deeper in $HOME were not scanned)."
+            );
             break;
         }
         let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -296,7 +321,11 @@ fn home_config_files() -> Vec<PathBuf> {
                     continue;
                 }
                 stack.push((entry.path(), depth + 1));
-            } else {
+            } else if ft.is_file() {
+                // Only regular files. file_type() does not follow symlinks, so a
+                // FIFO, socket, device node, or a symlink named `.mcp.json` is
+                // skipped here - reading a FIFO would hang gurgl forever, and a
+                // symlink could redirect the later open off the intended file.
                 let fname = entry.file_name();
                 let is_mcp_json = fname.to_str() == Some(".mcp.json");
                 // Codex uses `config.toml`, but only a Codex one when it sits
@@ -312,35 +341,43 @@ fn home_config_files() -> Vec<PathBuf> {
     found
 }
 
-/// A short source label for a discovered `.mcp.json`, by where it lives.
+/// A short source label for a discovered `.mcp.json`, by where it lives. A
+/// plugin config lives under the Claude plugin root (`~/.claude/plugins/`), NOT
+/// anywhere a path merely contains "plugins" - `~/dev/app/plugins/x/.mcp.json`
+/// is an ordinary project, not a bundled plugin.
 fn label_for(path: &Path) -> &'static str {
-    if path.to_string_lossy().contains("/plugins/") {
-        "plugin"
-    } else {
-        "project"
+    if let Some(home) = dirs::home_dir() {
+        if path.starts_with(home.join(".claude").join("plugins")) {
+            return "plugin";
+        }
     }
+    "project"
 }
 
 fn collect(json: &Value, label: &str, path: &Path, out: &mut Vec<Discovered>) {
+    // Top-level servers belong to the file's own directory. For a project
+    // `.mcp.json` that IS the project directory the enable record is keyed by.
+    let dir = path.parent().map(|p| p.to_path_buf());
     if let Some(map) = json.get("mcpServers").and_then(|v| v.as_object()) {
         for (name, spec) in map {
-            out.push(parse(name, spec, &source(label, path)));
+            out.push(parse(name, spec, &source(label, path), dir.clone()));
         }
     }
-    // Claude Code's ~/.claude.json also nests servers per project.
+    // Claude Code's ~/.claude.json also nests servers per project; each belongs
+    // to its own project key, not the ~/.claude.json file's directory.
     if let Some(projects) = json.get("projects").and_then(|v| v.as_object()) {
         for (proj, pv) in projects {
             if let Some(map) = pv.get("mcpServers").and_then(|v| v.as_object()) {
                 for (name, spec) in map {
                     let src = format!("{} [{}]", source(label, path), short(Path::new(proj)));
-                    out.push(parse(name, spec, &src));
+                    out.push(parse(name, spec, &src, Some(PathBuf::from(proj))));
                 }
             }
         }
     }
 }
 
-fn parse(name: &str, spec: &Value, source: &str) -> Discovered {
+fn parse(name: &str, spec: &Value, source: &str, config_dir: Option<PathBuf>) -> Discovered {
     let command = spec
         .get("command")
         .and_then(|v| v.as_str())
@@ -377,6 +414,7 @@ fn parse(name: &str, spec: &Value, source: &str) -> Discovered {
         source: source.to_string(),
         // Filled in once by `discover()` after the client enable records are read.
         status: Status::Configured,
+        config_dir,
     }
 }
 
@@ -384,8 +422,11 @@ fn parse(name: &str, spec: &Value, source: &str) -> Discovered {
 /// their own config so gurgl can distinguish "turned on" from "just present".
 #[derive(Default)]
 struct EnabledIndex {
-    /// `.mcp.json` server names in some project's `enabledMcpjsonServers`.
-    mcp_servers: std::collections::HashSet<String>,
+    /// `.mcp.json` servers a client enabled, as (project_dir, name) pairs. Keyed
+    /// by project, NOT flattened by bare name: `enabledMcpjsonServers` is a
+    /// per-project record, and a name enabled in project A must not mark a
+    /// same-named server in project B as enabled.
+    mcp_servers: std::collections::HashSet<(String, String)>,
     /// Plugin names from an `enabledPlugins` record (normalised, `name@mkt` ->
     /// `name`).
     plugins: std::collections::HashSet<String>,
@@ -404,8 +445,12 @@ impl EnabledIndex {
         // live in ~/.claude.json.
         if let Some(json) = read_json(&home.join(".claude.json")) {
             if let Some(projects) = json.get("projects").and_then(|v| v.as_object()) {
-                for pv in projects.values() {
-                    collect_str_array(pv.get("enabledMcpjsonServers"), &mut idx.mcp_servers);
+                for (proj, pv) in projects {
+                    if let Some(arr) = pv.get("enabledMcpjsonServers").and_then(|v| v.as_array()) {
+                        for name in arr.iter().filter_map(|s| s.as_str()) {
+                            idx.mcp_servers.insert((proj.clone(), name.to_string()));
+                        }
+                    }
                     collect_plugin_ids(pv.get("enabledPlugins"), &mut idx.plugins);
                 }
             }
@@ -422,9 +467,21 @@ impl EnabledIndex {
     }
 
     fn status_for(&self, d: &Discovered) -> Status {
-        let is_plugin = d.source.starts_with("plugin ") || d.source.contains("/plugins/");
-        let enabled =
-            self.mcp_servers.contains(&d.name) || (is_plugin && self.plugins.contains(&d.name));
+        // label_for now sets the "plugin" label only for real plugin roots.
+        let is_plugin = d.source.starts_with("plugin ");
+        let enabled = if is_plugin {
+            self.plugins.contains(&d.name)
+        } else {
+            // Enabled only when THIS server's project has it in its own
+            // enabledMcpjsonServers. If we can't determine the project, we never
+            // claim Enabled (safe direction: under-report, never over-report).
+            match &d.config_dir {
+                Some(dir) => self
+                    .mcp_servers
+                    .contains(&(dir.to_string_lossy().to_string(), d.name.clone())),
+                None => false,
+            }
+        };
         if enabled {
             Status::Enabled
         } else if is_plugin {
@@ -436,15 +493,7 @@ impl EnabledIndex {
 }
 
 fn read_json(path: &Path) -> Option<Value> {
-    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
-}
-
-fn collect_str_array(v: Option<&Value>, out: &mut std::collections::HashSet<String>) {
-    if let Some(arr) = v.and_then(|x| x.as_array()) {
-        for s in arr.iter().filter_map(|s| s.as_str()) {
-            out.insert(s.to_string());
-        }
-    }
+    serde_json::from_str(&read_capped(path)?).ok()
 }
 
 /// Pull enabled plugin identifiers from an `enabledPlugins` value, which is
@@ -582,6 +631,7 @@ mod tests {
             has_env: false,
             source: "Test".into(),
             status: Status::Configured,
+            config_dir: None,
         };
         let block = to_toml_block(&d);
         let cfg: crate::config::Config = toml::from_str(&block).unwrap();
@@ -605,6 +655,7 @@ mod tests {
             has_env: false,
             source: "Test".into(),
             status: Status::Configured,
+            config_dir: None,
         };
         let block = to_toml_block(&d);
         let cfg: crate::config::Config =
@@ -614,7 +665,7 @@ mod tests {
         assert_eq!(cfg.servers[0].args[1], "tab\there");
     }
 
-    fn disc(name: &str, source: &str) -> Discovered {
+    fn disc(name: &str, source: &str, dir: Option<&str>) -> Discovered {
         Discovered {
             name: name.into(),
             command: Some("bun".into()),
@@ -623,19 +674,22 @@ mod tests {
             has_env: false,
             source: source.into(),
             status: Status::Configured,
+            config_dir: dir.map(PathBuf::from),
         }
     }
 
     #[test]
     fn status_marks_enabled_bundled_and_configured() {
         let mut idx = EnabledIndex::default();
-        idx.mcp_servers.insert("statewright".into());
+        idx.mcp_servers
+            .insert(("/home/x/proj".into(), "statewright".into()));
         idx.plugins.insert("discord".into());
 
         // A plugin listed in enabledPlugins -> Enabled.
         let on = disc(
             "discord",
             "plugin (~/.claude/plugins/.../discord/.mcp.json)",
+            None,
         );
         assert_eq!(idx.status_for(&on), Status::Enabled);
 
@@ -643,15 +697,32 @@ mod tests {
         let off = disc(
             "telegram",
             "plugin (~/.claude/plugins/.../telegram/.mcp.json)",
+            None,
         );
         assert_eq!(idx.status_for(&off), Status::Bundled);
 
-        // A project/user config server in enabledMcpjsonServers -> Enabled.
-        let approved = disc("statewright", "project (~/.claude/.mcp.json)");
+        // A project server enabled in ITS project's enabledMcpjsonServers -> Enabled.
+        let approved = disc(
+            "statewright",
+            "project (~/proj/.mcp.json)",
+            Some("/home/x/proj"),
+        );
         assert_eq!(idx.status_for(&approved), Status::Enabled);
 
+        // The SAME name in a DIFFERENT project must NOT inherit that enable.
+        let elsewhere = disc(
+            "statewright",
+            "project (~/other/.mcp.json)",
+            Some("/home/x/other"),
+        );
+        assert_eq!(idx.status_for(&elsewhere), Status::Configured);
+
         // A configured-but-unapproved project server -> Configured.
-        let pending = disc("monarch", "project (~/some/repo/.mcp.json)");
+        let pending = disc(
+            "monarch",
+            "project (~/some/repo/.mcp.json)",
+            Some("/home/x/some/repo"),
+        );
         assert_eq!(idx.status_for(&pending), Status::Configured);
     }
 

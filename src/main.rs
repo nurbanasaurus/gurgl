@@ -36,6 +36,16 @@ use crate::store::Store;
 ///   1 = drift detected (`diff --check`, `watch --diff`)
 ///   2 = error
 fn main() {
+    // If a panic happens while the live dashboard owns the terminal, restore the
+    // terminal FIRST so the panic message lands on a normal screen instead of
+    // being erased by the alternate-screen teardown during unwinding.
+    // emergency_restore is idempotent and no-ops when the dashboard is inactive.
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        report::emergency_restore();
+        prev_hook(info);
+    }));
+
     match run() {
         Ok(code) => std::process::exit(code),
         Err(e) => {
@@ -724,9 +734,11 @@ fn cmd_watch(
     // completed, in every watch mode. A second Ctrl-C force-quits.
     observe::arm_interrupt();
 
-    // Live dashboard when attached to a terminal; plain lines when piped or with
-    // --plain, so logs and scripts are unaffected.
-    let mode = if plain || !std::io::stderr().is_terminal() {
+    // Live dashboard only when attached to a terminal AND in the foreground;
+    // plain lines when piped, with --plain, or backgrounded. A backgrounded
+    // `gurgl watch &` still has the tty as stderr, so is_terminal() alone would
+    // let it seize the interactive shell's screen.
+    let mode = if plain || !std::io::stderr().is_terminal() || !report::terminal_is_foreground() {
         report::Mode::Plain
     } else {
         report::Mode::Dashboard
@@ -1371,7 +1383,12 @@ fn parse_hold(s: &str) -> Result<std::time::Duration> {
     if n == 0 {
         bail!("--for duration must be greater than zero");
     }
-    Ok(std::time::Duration::from_secs(n * mult))
+    // Checked: a huge value times the unit multiplier would overflow u64 (a debug
+    // panic, or a wrapped bogus duration in release).
+    let secs = n
+        .checked_mul(mult)
+        .with_context(|| format!("--for duration '{s}' is too large"))?;
+    Ok(std::time::Duration::from_secs(secs))
 }
 
 fn cmd_discover(import: bool, json: bool, target: &Path) -> Result<()> {
@@ -1595,20 +1612,35 @@ fn cmd_update() -> Result<()> {
     let home = config::gurgl_home();
     let src = home.join("src");
 
-    if src.join(".git").is_dir() {
+    let git = |args: &[&str]| -> bool {
+        run_cmd(Command::new("git").arg("-C").arg(&src).args(args)).is_ok()
+    };
+
+    // Decide whether we can update in place or must re-clone. The managed
+    // checkout can be wedged: an interrupted clone (SIGKILL/power loss), a dirty
+    // tree (someone edited ~/.gurgl/src), an unfinished merge, or an upstream
+    // force-push that `pull --ff-only` can never take. Recover automatically -
+    // the checkout is gurgl-managed, so discarding local state is correct.
+    let need_clone = if src.join(".git").is_dir() {
         println!(">> updating gurgl source in {} ...", src.display());
-        run_cmd(
-            Command::new("git")
-                .arg("-C")
-                .arg(&src)
-                .args(["pull", "--ff-only"]),
-        )?;
+        if git(&["pull", "--ff-only"]) {
+            false
+        } else {
+            println!(">> pull failed; resetting the managed checkout to the remote ...");
+            !(git(&["fetch", "origin"]) && git(&["reset", "--hard", "origin/HEAD"]))
+        }
     } else {
+        true
+    };
+
+    if need_clone {
         std::fs::create_dir_all(&home).with_context(|| format!("creating {}", home.display()))?;
         if src.exists() {
+            println!(">> re-cloning gurgl (previous checkout unusable) ...");
             std::fs::remove_dir_all(&src).with_context(|| format!("clearing {}", src.display()))?;
+        } else {
+            println!(">> fetching gurgl from {REPO} ...");
         }
-        println!(">> fetching gurgl from {REPO} ...");
         run_cmd(Command::new("git").arg("clone").arg(REPO).arg(&src))?;
     }
 

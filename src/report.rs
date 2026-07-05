@@ -197,7 +197,11 @@ impl DashboardReporter {
         // events. All it does is read state and paint; capture only mutates.
         let st = state.clone();
         let handle = thread::spawn(move || loop {
-            {
+            // Build the frame under the lock, then RELEASE it before writing.
+            // A stopped tty (Ctrl-S / IXON flow control) makes write_all block;
+            // holding the state mutex across that blocking write would wedge the
+            // capture thread and the graceful stop until output resumed.
+            let frame = {
                 let s = match st.lock() {
                     Ok(s) => s,
                     Err(_) => break,
@@ -205,11 +209,11 @@ impl DashboardReporter {
                 if s.done {
                     break;
                 }
-                let mut err = io::stderr();
-                let frame = render(&s);
-                let _ = err.write_all(frame.as_bytes());
-                let _ = err.flush();
-            }
+                render(&s)
+            };
+            let mut err = io::stderr();
+            let _ = err.write_all(frame.as_bytes());
+            let _ = err.flush();
             thread::sleep(Duration::from_millis(200));
         });
 
@@ -516,8 +520,14 @@ mod rawin {
                 return None;
             }
             let orig = t;
-            // Keep ISIG so Ctrl-C still raises SIGINT (the graceful stop).
+            // Keep ISIG so Ctrl-C still raises SIGINT (the graceful stop), but
+            // neutralize the SUSP character (Ctrl-Z): with the dashboard on the
+            // alternate screen, a SIGTSTP would stop the process leaving the tty
+            // on the alt screen, cursor hidden, and bracketed paste on. Disabled
+            // here, Ctrl-Z is read as an ordinary (ignored) byte. Quit cleanly
+            // with `q` or Ctrl-C.
             t.c_lflag &= !(libc::ICANON | libc::ECHO);
+            t.c_cc[libc::VSUSP] = 0;
             t.c_cc[libc::VMIN] = 0;
             t.c_cc[libc::VTIME] = 1;
             if libc::tcsetattr(0, libc::TCSANOW, &t) != 0 {
@@ -591,6 +601,22 @@ pub fn emergency_restore() {
             let _ = std::io::stderr().write_all(SEQ);
         }
     }
+}
+
+/// Whether our process group is the terminal's foreground group. A backgrounded
+/// `gurgl watch &` must not seize the alternate screen: its stderr is still the
+/// tty (writes succeed), so `is_terminal()` alone is not enough - without this
+/// it grabs the interactive shell's screen while raw input silently declines.
+#[cfg(unix)]
+pub fn terminal_is_foreground() -> bool {
+    unsafe {
+        let pg = libc::tcgetpgrp(2);
+        pg >= 0 && pg == libc::getpgrp()
+    }
+}
+#[cfg(not(unix))]
+pub fn terminal_is_foreground() -> bool {
+    true
 }
 
 // ---- rendering (pure-ish helpers) ------------------------------------------
@@ -813,11 +839,22 @@ fn pad_between(left: &str, right: &str, w: usize) -> String {
 }
 
 fn term_width() -> usize {
+    // Query the tty directly. COLUMNS is a shell-internal variable that is
+    // almost never exported into gurgl's environment, so relying on it gave
+    // nearly every real run the fallback width (and garbled 80-column
+    // terminals). TIOCGWINSZ is authoritative and also tracks live resizes.
+    #[cfg(unix)]
+    unsafe {
+        let mut ws: libc::winsize = std::mem::zeroed();
+        if libc::ioctl(2, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 {
+            return (ws.ws_col as usize).clamp(40, 200);
+        }
+    }
     std::env::var("COLUMNS")
         .ok()
         .and_then(|c| c.parse::<usize>().ok())
         .unwrap_or(100)
-        .clamp(70, 160)
+        .clamp(40, 200)
 }
 
 #[cfg(test)]

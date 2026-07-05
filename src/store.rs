@@ -141,6 +141,19 @@ impl Store {
         safe_key("server", server)?;
         safe_key("version", version)?;
         let path = self.root.join(server).join(format!("{version}.json"));
+        // Cap the read. A snapshot is host names + counts (tiny); the cap bounds
+        // memory when loading from an UNTRUSTED store (`diff --against <dir>`,
+        // whose ordering scan calls this for every file), where a hostile
+        // multi-GB snapshot would otherwise OOM. `versions()` treats the error as
+        // an unreadable snapshot and skips it, so a legit store is unaffected.
+        const MAX_SNAPSHOT: u64 = 8 * 1024 * 1024;
+        if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > MAX_SNAPSHOT {
+            bail!(
+                "snapshot {} exceeds the {} MiB cap",
+                path.display(),
+                MAX_SNAPSHOT / 1024 / 1024
+            );
+        }
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("reading snapshot {}", path.display()))?;
         let snap: Snapshot =

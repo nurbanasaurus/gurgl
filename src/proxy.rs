@@ -73,30 +73,45 @@ pub fn parse_flows(path: &Path) -> Result<Vec<RawFlow>> {
             continue;
         };
         // Normalize a host that is attacker-influenced (the observed server
-        // chooses what it connects to). ORDER MATTERS: strip control characters
-        // FIRST - a hostname carrying an ANSI escape must never reach the terminal
-        // or store, and a trailing control byte must not shield the FQDN root dot
-        // or stray whitespace from the trims below. Then lowercase, then trim
-        // whitespace and the trailing root dot TOGETHER so "api.example.com.",
-        // "api.example.com " and "api.example.com" all collapse to one host (not
-        // two split across trials below the reproduction gate), and a just-dots or
-        // empty authority is dropped rather than recorded as a phantom host.
-        let cleaned: String = host
-            .chars()
-            .filter(|c| !c.is_control())
-            .collect::<String>()
-            .to_ascii_lowercase();
-        let host = cleaned
-            .trim()
-            .trim_end_matches(|c: char| c == '.' || c.is_whitespace())
-            .to_string();
-        if host.is_empty() {
+        // chooses what it connects to). See normalize_host for the ordering
+        // rationale; an empty / just-dots / all-control authority is dropped.
+        let Some(host) = normalize_host(host) else {
             continue;
-        }
+        };
         let time = val.get("time").and_then(|t| t.as_f64()).unwrap_or(0.0);
         flows.push(RawFlow { host, time });
     }
     Ok(flows)
+}
+
+/// Normalize an observed or externally-loaded host name. ORDER MATTERS: strip
+/// control characters FIRST - a hostname carrying an ANSI escape must never reach
+/// the terminal or store, and a trailing control byte must not shield the FQDN
+/// root dot or stray whitespace from the trims. Then lowercase, then trim
+/// whitespace and the trailing root dot TOGETHER so "api.example.com.",
+/// "api.example.com " and "api.example.com" all collapse to one host (not two
+/// split across trials below the reproduction gate). Returns None for an empty /
+/// just-dots / all-control authority. Shared by the flow parser and the
+/// shared-capture loader so a hostile shared file gets the exact same, tested
+/// sanitization and the two paths cannot diverge.
+pub fn normalize_host(raw: &str) -> Option<String> {
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let host = cleaned
+        .trim()
+        .trim_end_matches(|c: char| c == '.' || c.is_whitespace());
+    (!host.is_empty()).then(|| host.to_string())
+}
+
+/// Strip control bytes from an untrusted DISPLAY string (a version, flight-plan
+/// fingerprint, or note loaded from a shared file) so an embedded ANSI escape
+/// can't corrupt the terminal when shown. Not a host name - no dot/whitespace
+/// trimming, no lowercasing.
+pub fn strip_control(raw: &str) -> String {
+    raw.chars().filter(|c| !c.is_control()).collect()
 }
 
 #[cfg(test)]

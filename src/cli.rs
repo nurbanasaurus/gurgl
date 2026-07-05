@@ -66,13 +66,43 @@ pub enum Commands {
         /// capture, instead of the latest two.
         #[arg(long, conflicts_with_all = ["from", "to"])]
         baseline: bool,
+        /// Compare your latest LOCAL capture against a shared capture from someone
+        /// else - a local `gurgl export` file, a raw snapshot, or another gurgl
+        /// store directory. Exploratory only, never a pass/fail: a shared capture
+        /// is not a verified reference, and matching it proves nothing (a tool can
+        /// exfiltrate over a host it already contacts - docs/THREAT-MODEL.md).
+        /// gurgl never fetches over the network; pass a local PATH.
+        #[arg(long, value_name = "PATH", conflicts_with_all = ["from", "to", "baseline", "check"])]
+        against: Option<PathBuf>,
         /// Exit 1 when new stable hosts were observed (for CI/cron gates).
         /// `unknown` (default) triggers only on hosts needing scrutiny
         /// (unknown / telemetry?); `any` triggers on any new stable host.
         /// Exit codes: 0 = no drift at this threshold, 1 = drift, 2 = error.
+        /// Not available with `--against`: a stranger's capture must never be a
+        /// pass/fail gate.
         #[arg(long, value_name = "LEVEL", num_args = 0..=1,
               default_missing_value = "unknown", value_parser = ["unknown", "any"])]
         check: Option<String>,
+    },
+
+    /// Export a scrubbed, shareable capture of a server's observed egress (stable
+    /// hosts only, no verdict) for others to `diff --against`. Writes JSON to
+    /// stdout, or to a file with -o. Read docs/PUBLISHING.md before sharing
+    /// anything that names a third party.
+    Export {
+        server: String,
+        /// Version to export (default: the latest capture).
+        version: Option<String>,
+        /// Write to this file instead of stdout (refuses to overwrite; use --force).
+        #[arg(long, short = 'o', value_name = "FILE")]
+        output: Option<PathBuf>,
+        /// Rename the server in the exported file (default: your local label,
+        /// which may identify you - review it before sharing).
+        #[arg(long, value_name = "NAME")]
+        as_name: Option<String>,
+        /// Overwrite the output file if it already exists.
+        #[arg(long)]
+        force: bool,
     },
 
     /// Emit an allowlist from a snapshot for an enforcement engine.

@@ -16,6 +16,7 @@ mod observe;
 mod proxy;
 mod report;
 mod sandbox;
+mod share;
 mod store;
 
 use std::io::IsTerminal;
@@ -87,15 +88,41 @@ fn run() -> Result<i32> {
             from,
             to,
             baseline,
+            against,
             check,
-        }) => cmd_diff(
+        }) => match against {
+            // --against compares the local capture to someone else's SHARED
+            // capture: exploratory, never a pass/fail (see cmd_diff_against).
+            Some(path) => {
+                let first_party = cfg
+                    .server(server)
+                    .map(|s| s.first_party.clone())
+                    .unwrap_or_default();
+                cmd_diff_against(&store, server, path, &first_party, cli.json)
+            }
+            None => cmd_diff(
+                &store,
+                server,
+                from.as_deref(),
+                to.as_deref(),
+                *baseline,
+                check.as_deref(),
+                cli.json,
+            ),
+        },
+        Some(Commands::Export {
+            server,
+            version,
+            output,
+            as_name,
+            force,
+        }) => cmd_export(
             &store,
             server,
-            from.as_deref(),
-            to.as_deref(),
-            *baseline,
-            check.as_deref(),
-            cli.json,
+            version.as_deref(),
+            output.as_deref(),
+            as_name.as_deref(),
+            *force,
         ),
         Some(Commands::Allow {
             server,
@@ -690,6 +717,235 @@ fn cmd_allow(store: &Store, server: &str, version: Option<&str>, format: &str) -
     let fmt = emit::Format::from_str(format).map_err(|e| anyhow::anyhow!(e))?;
     print!("{}", emit::allowlist(&snap, fmt));
     Ok(())
+}
+
+/// `gurgl export`: write a scrubbed, shareable capture (stable hosts only, no
+/// verdict, guardrails baked in). JSON to stdout, or to a file with -o. The
+/// bundle carries the publishing rules IN-BAND; we ALSO surface them plus the
+/// exact host list on stderr so the exporter sees them at export time.
+fn cmd_export(
+    store: &Store,
+    server: &str,
+    version: Option<&str>,
+    out: Option<&Path>,
+    as_name: Option<&str>,
+    force: bool,
+) -> Result<i32> {
+    let v = match version {
+        Some(v) => v.to_string(),
+        None => store.latest(server)?.with_context(|| {
+            format!("no captures for '{server}' - run `gurgl watch {server}` first")
+        })?,
+    };
+    let snap = store.load(server, &v)?;
+    let bundle = share::export(&snap, as_name);
+    let text = serde_json::to_string_pretty(&bundle)?;
+
+    // Everything human goes to STDERR so stdout stays a clean bundle when piped
+    // (`gurgl export foo > bundle.json`), matching `allow`.
+    if bundle.hosts.is_empty() {
+        eprintln!(
+            "note: {}@{} has no STABLE hosts to share - only reproduced (stable) hosts are \
+             exportable. Capture a battery of >=2 trials so the reproduction gate can apply.",
+            bundle.server, bundle.version
+        );
+    }
+    eprintln!(
+        "shared capture of {} @ {} - {} stable host(s):",
+        bundle.server,
+        bundle.version,
+        bundle.hosts.len()
+    );
+    for h in &bundle.hosts {
+        eprintln!("    {}", h.name);
+    }
+    eprintln!(
+        "\nreview before you share (this file names a third party):\n  \
+         - server label written: '{}'{} - it may identify you; rename with --as-name.\n  \
+         - a host reached via a tool-call ARGUMENT may be YOURS, not the tool's.\n  \
+         - a host that reveals internal infrastructure should be removed by hand.\n  \
+         - publishing named observations takes on real legal/ethical exposure:\n    \
+         form an entity + carry insurance, coordinate disclosure, never punch down (docs/PUBLISHING.md).\n  \
+         - it is presence-only and NOT a verdict: matching it is not a clean bill of health.",
+        bundle.server,
+        if as_name.is_some() {
+            " (from --as-name)"
+        } else {
+            " (your local label)"
+        }
+    );
+
+    match out {
+        Some(path) => {
+            if path.exists() && !force {
+                bail!(
+                    "{} already exists - pass --force to overwrite",
+                    path.display()
+                );
+            }
+            store::write_atomic(path, format!("{text}\n").as_bytes())?;
+            eprintln!("\nwrote {}", path.display());
+        }
+        None => println!("{text}"),
+    }
+    Ok(0)
+}
+
+/// `gurgl diff <server> --against <PATH>`: compare the local capture to someone
+/// else's SHARED capture. Exploratory, NEVER a pass/fail - a shared capture is an
+/// untrusted, presence-only sample authored by a stranger, not a verified
+/// reference. It carries no exit-code verdict (0 = compared, 2 = error); matching
+/// it is explicitly not a pass and not evidence of no exfiltration.
+fn cmd_diff_against(
+    store: &Store,
+    server: &str,
+    against: &Path,
+    first_party: &[String],
+    json: bool,
+) -> Result<i32> {
+    let local_v = store.latest(server)?.with_context(|| {
+        format!("no local captures for '{server}' - run `gurgl watch {server}` first")
+    })?;
+    let local = store.load(server, &local_v)?;
+
+    // The other side is loaded as HOSTILE input: capped, control-stripped,
+    // re-gated, and reclassified with OUR first_party (never the producer's).
+    let loaded = share::load_against(against, server, first_party)?;
+    let other = &loaded.snapshot;
+
+    // diff(from = the shared capture, to = local): `added` = hosts WE saw the
+    // shared capture did not; `removed` = hosts it saw we did not.
+    let d = diff::diff(other, &local);
+    let acks = store.acks(server).unwrap_or_default();
+    let acked: Vec<String> = acks.iter().map(|a| a.host.clone()).collect();
+
+    // The reproduction gate applies to OUR side too: only stable local additions
+    // are comparable, and only the scrutiny-class ones are worth flagging.
+    let (scrutiny_acked, scrutiny): (Vec<&diff::HostDelta>, Vec<&diff::HostDelta>) = d
+        .stable_unknown_added()
+        .into_iter()
+        .partition(|h| acked.iter().any(|a| a == &h.name));
+
+    // A shared capture with no flight-plan fingerprint is an unknown method, so
+    // treat it as a mismatch (it cannot be assumed to match ours).
+    let fp_equal = !other.flightplan.is_empty() && other.flightplan == local.flightplan;
+    let shared_fp = if other.flightplan.is_empty() {
+        "unknown".to_string()
+    } else {
+        other.flightplan.clone()
+    };
+
+    if json {
+        let out = serde_json::json!({
+            "schema": "gurgl.diff-against/1",
+            "server": server,
+            "local_version": local_v,
+            "source": loaded.source,
+            "you_saw_shared_did_not": d.added.iter().map(|h| &h.name).collect::<Vec<_>>(),
+            "you_saw_stable": d.stable_added().iter().map(|h| &h.name).collect::<Vec<_>>(),
+            "you_saw_needs_scrutiny": scrutiny.iter().map(|h| &h.name).collect::<Vec<_>>(),
+            "shared_saw_you_did_not": d.removed.iter().map(|h| &h.name).collect::<Vec<_>>(),
+            "also_present_in_shared": d.unchanged,
+            "your_flightplan": local.flightplan,
+            "shared_flightplan": shared_fp,
+            "flightplan_fingerprint_equal": fp_equal,
+            "note": "presence only, and NOT a verdict. A shared capture is one observer's untrusted, \
+                     presence-only sample under their own flight plan - not a verified or known-good \
+                     reference. Agreement is NOT a pass and NOT evidence of no exfiltration (a tool can \
+                     exfiltrate over a host it already contacts). It is not an allowlist. See docs/THREAT-MODEL.md.",
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(0);
+    }
+
+    println!(
+        "comparing your capture of {server}@{local_v} against a shared capture\n  source: {}",
+        loaded.source
+    );
+    println!(
+        "  [the shared capture is one observer's presence-only sample under their own flight plan -\n   \
+         NOT a vetted or known-good reference. Having more or fewer hosts than it is expected.]"
+    );
+    if !fp_equal {
+        // Different (or unknown) methods exercise different egress: the delta is
+        // largely a method artifact, not the tool. For a foreign capture you
+        // usually cannot re-capture the other side, so the remediation differs
+        // from the local version-over-version diff.
+        println!(
+            "  ! flight plans differ (yours: {}, shared: {}): different methods exercise different \
+             egress, so this is NOT apples-to-apples. Re-capture locally under the shared plan (if you \
+             have it) to compare cleanly; otherwise read every delta as method divergence.",
+            local.flightplan, shared_fp
+        );
+    }
+
+    if d.added.is_empty() {
+        // The agreement case is where "matches = clean" is most tempting, so state
+        // the trusted-channel limit right here, not only in the footer.
+        println!(
+            "\n  you observed no hosts beyond the shared capture.\n  \
+             this is NOT a pass: matching a shared capture is not a clean bill of health - a tool \
+             exfiltrating over a host it already contacts produces an identical set, which gurgl cannot see."
+        );
+    } else {
+        println!("\n  hosts YOU observed that the shared capture did not:");
+        for delta in &d.added {
+            let flag = match delta.reproducibility {
+                Reproducibility::Stable => "",
+                Reproducibility::Observed => "  (single observation - reproducibility untested)",
+                Reproducibility::Intermittent => "  (intermittent - likely cohort noise)",
+            };
+            println!("    + {:<40} [{}]{}", delta.name, delta.class, flag);
+        }
+        if !scrutiny.is_empty() {
+            println!(
+                "\n  ⚠ {} stable host(s) here matched no known rule - worth a look. This is NOT proof \
+                 of wrongdoing: a different version, a server-side cohort, a different flight plan, or \
+                 your own tool-call arguments can all add hosts the shared capture lacks:",
+                scrutiny.len()
+            );
+            for u in &scrutiny {
+                println!("    {}  [{}]", u.name, u.class);
+            }
+        }
+        if !scrutiny_acked.is_empty() {
+            println!(
+                "\n  {} of these you previously acknowledged (gurgl ack {server} --list): {}",
+                scrutiny_acked.len(),
+                scrutiny_acked
+                    .iter()
+                    .map(|h| h.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
+
+    if !d.removed.is_empty() {
+        println!(
+            "\n  hosts in the shared capture you did NOT observe ({}):",
+            d.removed.len()
+        );
+        for delta in &d.removed {
+            println!("    - {:<40} [{}]", delta.name, delta.class);
+        }
+        println!(
+            "    (a version, cohort, coverage, or flight-plan difference - not \"you are missing something\")"
+        );
+    }
+
+    // Overlap count last and de-emphasized: agreement is not a score.
+    println!(
+        "\n  hosts also present in the shared capture: {} (overlap is not verification)",
+        d.unchanged
+    );
+
+    println!(
+        "\nnote: presence only, and NOT a verdict. A shared capture is untrusted, presence-only \
+         evidence authored by a stranger - it can miss hosts or list extra ones, and it is not an \
+         allowlist. Agreement with it is not a pass and not proof of no exfiltration (docs/THREAT-MODEL.md)."
+    );
+    Ok(0)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1346,23 +1602,12 @@ fn cmd_accept(store: &Store, server: &str, version: Option<&str>, clear: bool) -
 }
 
 /// Today as YYYY-MM-DD (UTC), from the system clock - no date dependency.
-/// Civil-from-days algorithm (Howard Hinnant's); valid for the unix era.
 fn today() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let z = (secs / 86_400) as i64 + 719_468;
-    let era = z / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    format!("{y:04}-{m:02}-{d:02}")
+    share::date_from_epoch(secs)
 }
 
 /// Parse a `--for` duration like `30s`, `5m`, `1h` (a bare number is seconds).

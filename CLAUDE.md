@@ -92,6 +92,14 @@ Path helpers live in `config.rs` (`gurgl_home()`, `default_config_path()`,
   `--dir`) so the starter config works out of the box.
 - `diff.rs` - pure `diff(from, to) -> SnapshotDiff`.
 - `emit.rs` - `allowlist(snapshot, Format)` for sandbox-runtime / opensnitch / squid.
+- `share.rs` - `gurgl export` (scrub a snapshot into a shareable "shared capture":
+  stable hosts only, `class` dropped, time coarsened to a date, publishing
+  guardrails baked in-band) and `load_against` for `diff --against`. A consumed
+  shared capture is UNTRUSTED input: size-capped, every string control-stripped
+  (`proxy::normalize_host`/`strip_control`), the reproduction gate re-applied
+  locally, schema tag-gated, and a URL refused (never fetched - #5). A shared
+  capture is not a "baseline" and matching one is never a pass (see #1); the word
+  "baseline" stays reserved for the locally-accepted reviewed pointer.
 - `store.rs` - JSON snapshots at `<store>/<server>/<version>.json`, plus two
   human-review sidecars per server: `acks.toml` (`gurgl ack` - reviewed hosts,
   worded "acknowledged" never "approved") and `baseline` (`gurgl accept` - the
@@ -119,7 +127,10 @@ Path helpers live in `config.rs` (`gurgl_home()`, `default_config_path()`,
   library code. User-facing errors should say what to do next.
 - Exit codes are a documented contract: 0 = ok/no drift, 1 = drift
   (`diff --check`, `watch --diff`) or blocked (`doctor`), 2 = error. `run()` returns the code; don't
-  add new nonzero meanings casually. `--json` outputs carry a versioned
+  add new nonzero meanings casually. `diff --against <shared capture>` is
+  deliberately exploratory: it returns 0 (compared) or 2 (error) and NEVER 1 -
+  a stranger's capture must never be a pass/fail gate (#1), so `--check` is
+  forbidden with `--against`. `--json` outputs carry a versioned
   `schema` field (`gurgl.diff/1` ...) - breaking a schema needs a version bump.
   The drift gate (`drift_hosts` in main.rs) honors acks and never counts
   intermittent hosts (the reproduction gate applies to automation too).

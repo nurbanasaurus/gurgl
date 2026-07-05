@@ -62,7 +62,13 @@ pub(crate) fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
         std::process::id(),
         N.fetch_add(1, Ordering::Relaxed)
     ));
-    std::fs::write(&tmp, contents).with_context(|| format!("writing {}", tmp.display()))?;
+    if let Err(e) = std::fs::write(&tmp, contents) {
+        // Don't leave a partial temp behind when the write itself fails (e.g.
+        // ENOSPC): only the rename path cleaned up before, so repeated near-full-
+        // disk saves would litter the store with orphaned .tmp fragments.
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("writing {}", tmp.display()));
+    }
     if let Err(e) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e).with_context(|| format!("renaming into {}", path.display()));

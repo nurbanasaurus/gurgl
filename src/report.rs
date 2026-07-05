@@ -198,9 +198,10 @@ impl DashboardReporter {
         let st = state.clone();
         let handle = thread::spawn(move || loop {
             // Build the frame under the lock, then RELEASE it before writing.
-            // A stopped tty (Ctrl-S / IXON flow control) makes write_all block;
-            // holding the state mutex across that blocking write would wedge the
-            // capture thread and the graceful stop until output resumed.
+            // A slow or backpressured tty makes write_all block; holding the state
+            // mutex across that blocking write would wedge the capture thread and
+            // the graceful stop until output drains. (Ctrl-S/XOFF can no longer
+            // cause this - rawin::enable disables IXON - but a laggy pty still can.)
             let frame = {
                 let s = match st.lock() {
                     Ok(s) => s,
@@ -527,6 +528,13 @@ mod rawin {
             // here, Ctrl-Z is read as an ordinary (ignored) byte. Quit cleanly
             // with `q` or Ctrl-C.
             t.c_lflag &= !(libc::ICANON | libc::ECHO);
+            // Disable software flow control (IXON). Otherwise a stray Ctrl-S sends
+            // XOFF and the tty stops draining our output, parking the render
+            // thread mid-write_all; teardown then blocks forever joining that
+            // thread and the just-completed capture is never saved. Full-screen
+            // TUIs disable IXON for exactly this reason (a genuinely dead pty is
+            // still handled by the double-Ctrl-C force-quit).
+            t.c_iflag &= !(libc::IXON);
             t.c_cc[libc::VSUSP] = 0;
             t.c_cc[libc::VMIN] = 0;
             t.c_cc[libc::VTIME] = 1;

@@ -42,6 +42,18 @@ pub enum Status {
     Configured,
 }
 
+impl Status {
+    /// Merge order for dedup: when the same server surfaces in several places,
+    /// the strongest status wins (Enabled over merely present), so a server
+    /// enabled in ANY project is never reported as only configured.
+    fn rank(self) -> u8 {
+        match self {
+            Status::Enabled => 2,
+            Status::Bundled | Status::Configured => 1,
+        }
+    }
+}
+
 impl std::fmt::Display for Status {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.pad(match self {
@@ -132,9 +144,14 @@ fn config_files() -> Vec<(&'static str, PathBuf)> {
         v.push(("Cline (VS Code)", p));
     }
 
-    // Project-local, relative to the current directory.
-    v.push(("project", PathBuf::from(".mcp.json")));
-    v.push(("project", PathBuf::from(".cursor/mcp.json")));
+    // Project-local, in the current directory. Resolve to an ABSOLUTE path so the
+    // project dir (the key an enable record is matched by) is attributed
+    // correctly: a bare ".mcp.json" has an empty parent, which never matches an
+    // enable record and, inserted first, would mask the same file the $HOME walk
+    // finds with a correct absolute path. Absolute also lets the two dedup.
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    v.push(("project", cwd.join(".mcp.json")));
+    v.push(("project", cwd.join(".cursor/mcp.json")));
     v
 }
 
@@ -160,24 +177,49 @@ pub fn discover() -> Vec<Discovered> {
         }
     }
 
-    // A server can surface from more than one file (e.g. a plugin present in both
-    // the install cache and the marketplace). Keep the first, drop exact dupes.
-    let mut seen = std::collections::HashSet::new();
-    out.retain(|d| {
-        seen.insert((
-            d.name.clone(),
-            d.command.clone(),
-            d.url.clone(),
-            d.args.clone(),
-        ))
-    });
-
-    // Mark each as enabled / bundled / configured from the client enable records.
+    // Resolve each server's status (enabled / bundled / configured) from the
+    // client enable records BEFORE collapsing dupes. The same server can be
+    // configured in several projects and enabled in only some; a status computed
+    // on whichever entry happened to survive dedup would be arbitrary and could
+    // flip between runs with the (filesystem-dependent) walk order.
     let idx = EnabledIndex::load();
     for d in &mut out {
         d.status = idx.status_for(d);
     }
-    out
+    dedupe_strongest(out)
+}
+
+/// The identity two discovered servers are collapsed on: name + launch shape.
+type ServerKey = (String, Option<String>, Option<String>, Vec<String>);
+
+/// Collapse exact-duplicate discovered servers (same name/command/url/args) to
+/// one row, keeping the strongest status. A server surfaces more than once when a
+/// plugin sits in both the install cache and the marketplace, or when the same
+/// server is configured in several projects; status must already be resolved.
+fn dedupe_strongest(entries: Vec<Discovered>) -> Vec<Discovered> {
+    let mut idx_by_key: std::collections::HashMap<ServerKey, usize> =
+        std::collections::HashMap::new();
+    let mut merged: Vec<Discovered> = Vec::new();
+    for d in entries {
+        let key = (
+            d.name.clone(),
+            d.command.clone(),
+            d.url.clone(),
+            d.args.clone(),
+        );
+        match idx_by_key.get(&key) {
+            Some(&i) => {
+                if d.status.rank() > merged[i].status.rank() {
+                    merged[i].status = d.status;
+                }
+            }
+            None => {
+                idx_by_key.insert(key, merged.len());
+                merged.push(d);
+            }
+        }
+    }
+    merged
 }
 
 /// Read a config file, refusing non-regular files and absurdly large ones. Real
@@ -773,5 +815,31 @@ bearer_token_env_var = "TOKEN"
         assert!(out.contains("discord"));
         assert!(out.contains("telegram"));
         assert!(!out.contains("off")); // explicitly false -> not enabled
+    }
+
+    #[test]
+    fn dedupe_keeps_strongest_status() {
+        // The same server (identical command+args) configured in three projects,
+        // enabled in only one: the collapsed row must be Enabled regardless of the
+        // (filesystem-dependent) order the projects were walked, with one row.
+        let mk = |status| Discovered {
+            name: "github".into(),
+            command: Some("npx".into()),
+            args: vec!["-y".into(), "server-github".into()],
+            url: None,
+            has_env: false,
+            source: "x".into(),
+            status,
+            config_dir: None,
+        };
+        for order in [
+            vec![Status::Configured, Status::Enabled, Status::Configured],
+            vec![Status::Enabled, Status::Configured, Status::Configured],
+            vec![Status::Configured, Status::Configured, Status::Enabled],
+        ] {
+            let out = dedupe_strongest(order.into_iter().map(mk).collect());
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].status, Status::Enabled);
+        }
     }
 }

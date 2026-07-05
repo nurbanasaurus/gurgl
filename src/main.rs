@@ -824,8 +824,9 @@ fn cmd_watch(
                     let prev_label = compare_to.as_deref().unwrap_or("?");
                     match prev_before {
                         None => drift_lines.push(format!(
-                            "  {:<16} first capture - baseline recorded, nothing to compare yet",
-                            snap.server
+                            "  {:<16} first capture - nothing to compare yet; run \
+                             `gurgl accept {}` to set a reviewed baseline",
+                            snap.server, snap.server
                         )),
                         Some(Err(e)) => drift_lines.push(format!(
                             "  {:<16} could not compare against {prev_label}: {e:#} - re-run \

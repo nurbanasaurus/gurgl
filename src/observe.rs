@@ -346,8 +346,6 @@ pub fn capture(
 }
 
 /// Kill (and reap) a child when this guard drops, so an early return mid-trial
-/// never leaks a mitmdump or server process.
-/// Kill (and reap) a child when this guard drops, so an early return mid-trial
 /// never leaks a mitmdump or server process. When `group` is set (the sandboxed
 /// server, which pre_exec'd into its own process group), SIGKILL the whole group
 /// first: on macOS sandbox-exec execs the launcher in-process and the real MCP
@@ -357,6 +355,9 @@ pub fn capture(
 struct KillOnDrop {
     child: Child,
     group: bool,
+    /// Set once a caller's `try_wait` has reaped the child: its pid may then be
+    /// recycled, so Drop must NOT signal the (possibly reused) process group.
+    reaped: bool,
 }
 
 impl KillOnDrop {
@@ -364,15 +365,36 @@ impl KillOnDrop {
         Self {
             child,
             group: false,
+            reaped: false,
         }
     }
     fn group(child: Child) -> Self {
-        Self { child, group: true }
+        Self {
+            child,
+            group: true,
+            reaped: false,
+        }
+    }
+    /// try_wait, recording when the child has been reaped so Drop does not later
+    /// signal a possibly-recycled pid. Prefer this over `self.child.try_wait()`.
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        let r = self.child.try_wait();
+        if let Ok(Some(_)) = r {
+            self.reaped = true;
+        }
+        r
     }
 }
 
 impl Drop for KillOnDrop {
     fn drop(&mut self) {
+        // Already reaped (a caller's try_wait saw it exit): the pid may already be
+        // recycled by the OS, so the group signal below could hit an unrelated
+        // process group. Once the leader is reaped the tree is gone, so there is
+        // nothing left to kill - skip it.
+        if self.reaped {
+            return;
+        }
         #[cfg(unix)]
         if self.group {
             // The child is a group leader (setpgid(0,0) in pre_exec), so its pid
@@ -459,6 +481,33 @@ struct Trial {
 
 /// Run one trial: start the proxy, launch the sandboxed server through it, drive
 /// the flight plan over stdio, then read back the observed hosts.
+/// Names gurgl sets to route the sandboxed server's egress through the capture
+/// proxy and trust the lab CA. A pass_env entry colliding with any of these would
+/// override the capture wiring (routing around mitmdump, or re-enabling a
+/// NO_PROXY bypass), silently emptying the capture - so pass_env must not forward
+/// them. Compared case-insensitively (proxy vars are honored in both cases).
+fn is_capture_reserved(name: &str) -> bool {
+    const RESERVED: &[&str] = &[
+        "PATH",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "NODE_USE_ENV_PROXY",
+        "NODE_EXTRA_CA_CERTS",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "REQUESTS_CA_BUNDLE",
+        "CURL_CA_BUNDLE",
+    ];
+    RESERVED.iter().any(|r| r.eq_ignore_ascii_case(name))
+}
+
+/// Upper bound on a flight-plan `sleep` step, so a hostile or fat-fingered plan
+/// (`seconds` near u64::MAX) cannot overflow `Instant + Duration` (which panics).
+/// A sleep step is a short idle window; long observation is `watch --for`.
+const MAX_SLEEP_SECS: u64 = 24 * 60 * 60;
+
 fn run_trial(
     cfg: &Config,
     spec: &ServerSpec,
@@ -517,11 +566,28 @@ fn run_trial(
     // Forward only the env vars this server explicitly opted into (pass_env),
     // read from gurgl's own environment. The sandbox is otherwise env-cleared so
     // untrusted server code never inherits gurgl's whole environment.
-    let extra_env: Vec<(String, String)> = spec
-        .pass_env
-        .iter()
-        .filter_map(|k| std::env::var(k).ok().map(|v| (k.clone(), v)))
-        .collect();
+    let mut extra_env: Vec<(String, String)> = Vec::new();
+    for k in &spec.pass_env {
+        // pass_env must never smuggle in a variable that would redirect or
+        // un-capture the sandbox's egress. Forwarding a machine's corporate
+        // HTTPS_PROXY/NO_PROXY (or a CA/PATH override) would silently override the
+        // capture proxy/CA gurgl set - the child would route around mitmdump and
+        // the snapshot would read as "no egress". bwrap/podman apply extra_env
+        // AFTER the capture env (last --setenv / -e wins), so without this filter
+        // the forwarded var wins on Linux. Drop those names; note once.
+        if is_capture_reserved(k) {
+            if trial == 1 {
+                reporter.note(&format!(
+                    "ignoring pass_env '{k}': forwarding it would override gurgl's \
+                     capture proxy/CA and blind the capture"
+                ));
+            }
+            continue;
+        }
+        if let Ok(v) = std::env::var(k) {
+            extra_env.push((k.clone(), v));
+        }
+    }
     let argv = sandbox::build_argv(cfg.sandbox, spec, &penv, &extra_env);
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..]);
@@ -597,7 +663,7 @@ fn run_trial(
         // their stderr tail, never a false-clean snapshot. Hold mode's softer
         // server exit is allowed only later, in the monitor phase, once the
         // scripted plan has actually run.
-        if let Ok(Some(status)) = server_guard.child.try_wait() {
+        if let Ok(Some(status)) = server_guard.try_wait() {
             bail!("{}", dead_server_msg(&status, &step.phase, &stderr_tail));
         }
         check_proxy_alive(&mut proxy_guard.child, &step.phase, &proxy_stderr_tail)?;
@@ -635,7 +701,10 @@ fn run_trial(
             }
             // Poll during the idle sleep too, so late beacons stream in live.
             "sleep" => {
-                let end = Instant::now() + Duration::from_secs(step.seconds.unwrap_or(5));
+                // Cap the sleep so a near-u64::MAX `seconds` cannot overflow
+                // Instant + Duration (which panics); see MAX_SLEEP_SECS.
+                let secs = step.seconds.unwrap_or(5).min(MAX_SLEEP_SECS);
+                let end = Instant::now() + Duration::from_secs(secs);
                 while Instant::now() < end && !stop_requested() {
                     thread::sleep(Duration::from_millis(200));
                     surface_hosts(
@@ -669,7 +738,7 @@ fn run_trial(
         // any mode - never save that as a snapshot.
         check_proxy_alive(&mut proxy_guard.child, last_phase, &proxy_stderr_tail)?;
         if matches!(monitor, Monitor::Battery) {
-            if let Ok(Some(status)) = server_guard.child.try_wait() {
+            if let Ok(Some(status)) = server_guard.try_wait() {
                 bail!("{}", dead_server_msg(&status, last_phase, &stderr_tail));
             }
         }
@@ -709,7 +778,7 @@ fn run_trial(
                 }
             }
             // If the server exits on its own, there is nothing left to watch.
-            if matches!(server_guard.child.try_wait(), Ok(Some(_))) {
+            if matches!(server_guard.try_wait(), Ok(Some(_))) {
                 reporter.note("server process exited; ending watch");
                 break;
             }
@@ -819,12 +888,17 @@ fn drain_stderr_tail(
     if let Some(stderr) = stderr {
         let t = tail.clone();
         thread::spawn(move || {
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            let mut r = BufReader::new(stderr);
+            let mut line = String::new();
+            while let Ok(n) = read_capped_line(&mut r, &mut line) {
+                if n == 0 {
+                    break; // EOF
+                }
                 let mut g = t.lock().unwrap_or_else(|e| e.into_inner());
                 if g.len() >= 8 {
                     g.pop_front();
                 }
-                g.push_back(line);
+                g.push_back(std::mem::take(&mut line));
             }
         });
     }
@@ -948,6 +1022,55 @@ fn pick_benign_tool(resp: &Value, override_tool: Option<&str>) -> Option<String>
 
 // ---- small process / IO helpers ---------------------------------------------
 
+/// Cap on a single line buffered from a child's stdout/stderr. The observed
+/// server is attacker-influenced (CLAUDE.md): a stream with no '\n' would make
+/// `BufRead::lines()` grow one String without bound until gurgl is OOM-killed.
+/// The JSON-RPC lines gurgl needs are tiny, so this is orders of magnitude over
+/// any real line.
+const MAX_LINE: usize = 1 << 20; // 1 MiB
+
+/// Read one '\n'-terminated line from `r` into `out`, buffering at most MAX_LINE
+/// bytes: excess bytes are consumed (so we resync at the next newline) but never
+/// retained, so a hostile or oversized line cannot exhaust memory. Returns the
+/// number of bytes consumed (0 only at EOF with nothing left). Invalid UTF-8 is
+/// replaced lossily. Uses only BufRead so a pipe is not read byte-by-byte.
+fn read_capped_line(r: &mut impl BufRead, out: &mut String) -> std::io::Result<usize> {
+    out.clear();
+    let mut buf: Vec<u8> = Vec::new();
+    let mut total = 0usize;
+    loop {
+        let available = match r.fill_buf() {
+            Ok(b) => b,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if available.is_empty() {
+            break; // EOF
+        }
+        match available.iter().position(|&b| b == b'\n') {
+            Some(i) => {
+                let take = MAX_LINE.saturating_sub(buf.len()).min(i);
+                buf.extend_from_slice(&available[..take]);
+                total += i + 1;
+                r.consume(i + 1);
+                break;
+            }
+            None => {
+                let n = available.len();
+                let take = MAX_LINE.saturating_sub(buf.len()).min(n);
+                buf.extend_from_slice(&available[..take]);
+                total += n;
+                r.consume(n);
+            }
+        }
+    }
+    if total == 0 {
+        return Ok(0);
+    }
+    *out = String::from_utf8_lossy(&buf).into_owned();
+    Ok(total)
+}
+
 fn send(stdin: &mut impl Write, msg: &Value) {
     let _ = stdin.write_all(mcp::to_line(msg).as_bytes());
     let _ = stdin.flush();
@@ -956,10 +1079,13 @@ fn send(stdin: &mut impl Write, msg: &Value) {
 fn spawn_line_reader(stdout: std::process::ChildStdout) -> Receiver<String> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        for line in BufReader::new(stdout).lines() {
-            match line {
-                Ok(l) => {
-                    if tx.send(l).is_err() {
+        let mut r = BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            match read_capped_line(&mut r, &mut line) {
+                Ok(0) => break, // EOF
+                Ok(_) => {
+                    if tx.send(std::mem::take(&mut line)).is_err() {
                         break;
                     }
                 }
@@ -1169,5 +1295,59 @@ mod tests {
         ];
         let out = attribute_phases(raw, &marks);
         assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn capture_reserved_env_is_case_insensitive() {
+        // pass_env must never forward a variable that would override the capture
+        // proxy/CA (which would silently blind the capture), in either case.
+        for name in [
+            "HTTPS_PROXY",
+            "https_proxy",
+            "HTTP_PROXY",
+            "NO_PROXY",
+            "no_proxy",
+            "ALL_PROXY",
+            "PATH",
+            "SSL_CERT_FILE",
+            "NODE_EXTRA_CA_CERTS",
+            "NODE_USE_ENV_PROXY",
+            "REQUESTS_CA_BUNDLE",
+            "CURL_CA_BUNDLE",
+        ] {
+            assert!(is_capture_reserved(name), "{name} should be reserved");
+        }
+        for name in ["GITHUB_TOKEN", "MY_API_KEY", "HOME", "LANG"] {
+            assert!(!is_capture_reserved(name), "{name} should be allowed");
+        }
+    }
+
+    #[test]
+    fn read_capped_line_caps_an_unterminated_stream() {
+        use std::io::Cursor;
+        // A line far larger than MAX_LINE with no newline must be capped, not
+        // buffered whole (the OOM guard), and reported as bytes-consumed > 0.
+        let big = vec![b'x'; MAX_LINE * 3];
+        let mut r = Cursor::new(big);
+        let mut line = String::new();
+        let n = read_capped_line(&mut r, &mut line).unwrap();
+        assert_eq!(n, MAX_LINE * 3, "all bytes consumed");
+        assert_eq!(line.len(), MAX_LINE, "but only MAX_LINE retained");
+        // EOF now yields 0.
+        assert_eq!(read_capped_line(&mut r, &mut line).unwrap(), 0);
+    }
+
+    #[test]
+    fn read_capped_line_splits_on_newlines() {
+        use std::io::Cursor;
+        let mut r = Cursor::new(b"one\ntwo\nthree".to_vec());
+        let mut line = String::new();
+        read_capped_line(&mut r, &mut line).unwrap();
+        assert_eq!(line, "one");
+        read_capped_line(&mut r, &mut line).unwrap();
+        assert_eq!(line, "two");
+        read_capped_line(&mut r, &mut line).unwrap();
+        assert_eq!(line, "three"); // trailing, no newline
+        assert_eq!(read_capped_line(&mut r, &mut line).unwrap(), 0);
     }
 }

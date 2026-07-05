@@ -73,18 +73,23 @@ pub fn parse_flows(path: &Path) -> Result<Vec<RawFlow>> {
             continue;
         };
         // Normalize a host that is attacker-influenced (the observed server
-        // chooses what it connects to): strip ASCII/Unicode control characters
-        // so a hostname carrying an ANSI escape can't spoof or corrupt the
-        // terminal when shown, or the store when written; lowercase; and strip a
-        // trailing FQDN root dot so "api.example.com." and "api.example.com" are
-        // one host, not two split across trials below the reproduction gate.
-        let host: String = host
-            .trim()
-            .trim_end_matches('.')
+        // chooses what it connects to). ORDER MATTERS: strip control characters
+        // FIRST - a hostname carrying an ANSI escape must never reach the terminal
+        // or store, and a trailing control byte must not shield the FQDN root dot
+        // or stray whitespace from the trims below. Then lowercase, then trim
+        // whitespace and the trailing root dot TOGETHER so "api.example.com.",
+        // "api.example.com " and "api.example.com" all collapse to one host (not
+        // two split across trials below the reproduction gate), and a just-dots or
+        // empty authority is dropped rather than recorded as a phantom host.
+        let cleaned: String = host
             .chars()
             .filter(|c| !c.is_control())
             .collect::<String>()
             .to_ascii_lowercase();
+        let host = cleaned
+            .trim()
+            .trim_end_matches(|c: char| c == '.' || c.is_whitespace())
+            .to_string();
         if host.is_empty() {
             continue;
         }
@@ -155,6 +160,32 @@ mod tests {
         assert_eq!(flows.len(), 2);
         assert_eq!(flows[0].host, "api.example.com");
         assert_eq!(flows[1].host, "api.example.com");
+    }
+
+    #[test]
+    fn parse_flows_control_byte_does_not_shield_trailing_dot() {
+        // A trailing control byte must not shield the FQDN root dot from
+        // normalization: "evil.example." + DEL and "evil.example." must collapse
+        // to the SAME host (not split below the reproduction gate), and a
+        // just-dots-plus-control authority is dropped, not recorded as a phantom
+        // host. Regression: the trims once ran BEFORE the control-char filter, so
+        // a trailing DEL/ESC left a stranded dot no later stage re-trimmed.
+        // A raw DEL byte (U+007F): a control char that is NOT whitespace and NOT
+        // '.', so before the fix it shielded the trailing dot from the trims.
+        let del = '\u{7f}';
+        let l1 = format!(r#"{{"host":"evil.example.{del}","time":1.0}}"#);
+        let l2 = r#"{"host":"evil.example.","time":2.0}"#.to_string();
+        let l3 = format!(r#"{{"host":"..{del}","time":3.0}}"#);
+        let mut f = tempfile();
+        writeln!(f.0, "{l1}").unwrap();
+        writeln!(f.0, "{l2}").unwrap();
+        writeln!(f.0, "{l3}").unwrap();
+        f.0.flush().unwrap();
+        let flows = parse_flows(&f.1).unwrap();
+        // The just-dots+control host is dropped; the two real ones normalize equal.
+        assert_eq!(flows.len(), 2);
+        assert_eq!(flows[0].host, "evil.example");
+        assert_eq!(flows[1].host, "evil.example");
     }
 
     // Tiny temp-file helper to avoid a dev-dependency.

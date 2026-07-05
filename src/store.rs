@@ -13,10 +13,38 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::model::Snapshot;
+
+/// Reject a server or version string that is not a single, safe path component.
+///
+/// Server names and versions flow in from config files and client configs that
+/// may be attacker-influenced (a malicious `.mcp.json` picked up by
+/// `discover --import`). They are joined directly into store paths, so a value
+/// like `../../.ssh/authorized_keys` or an absolute path would let a capture
+/// read or write OUTSIDE the store. Everything that turns one into a path goes
+/// through here first; a bad key is a hard error, never a silent traversal.
+fn safe_key(kind: &str, value: &str) -> Result<()> {
+    let unsafe_key = value.is_empty()
+        || value == "."
+        || value == ".."
+        || value.contains('/')
+        || value.contains('\\')
+        || value.bytes().any(|b| b == 0)
+        || value.chars().any(|c| c.is_control())
+        || Path::new(value).is_absolute()
+        || Path::new(value).components().count() != 1;
+    if unsafe_key {
+        bail!(
+            "unsafe {kind} '{}': must be a single path component - no separators, '..', \
+             control characters, or absolute paths (it names a directory/file under the store)",
+            value.escape_debug()
+        );
+    }
+    Ok(())
+}
 
 /// One acknowledged host: the user reviewed it and recorded why. Wording is
 /// deliberate - "acknowledged", never "approved" or "safe".
@@ -56,6 +84,11 @@ impl Store {
     /// overwrites silently by design (re-capturing the same version refreshes
     /// it); callers use this to warn when that would destroy a baseline.
     pub fn exists(&self, server: &str, version: &str) -> bool {
+        // An unsafe key has no valid snapshot by definition; never let it probe
+        // an arbitrary filesystem path via is_file().
+        if safe_key("server", server).is_err() || safe_key("version", version).is_err() {
+            return false;
+        }
         self.root
             .join(server)
             .join(format!("{version}.json"))
@@ -63,6 +96,8 @@ impl Store {
     }
 
     pub fn save(&self, snap: &Snapshot) -> Result<PathBuf> {
+        safe_key("server", &snap.server)?;
+        safe_key("version", &snap.version)?;
         let dir = self.root.join(&snap.server);
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("creating snapshot dir {}", dir.display()))?;
@@ -73,6 +108,8 @@ impl Store {
     }
 
     pub fn load(&self, server: &str, version: &str) -> Result<Snapshot> {
+        safe_key("server", server)?;
+        safe_key("version", version)?;
         let path = self.root.join(server).join(format!("{version}.json"));
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("reading snapshot {}", path.display()))?;
@@ -102,6 +139,7 @@ impl Store {
 
     /// Versions of a server, sorted oldest-first by capture time.
     pub fn versions(&self, server: &str) -> Result<Vec<String>> {
+        safe_key("server", server)?;
         let dir = self.root.join(server);
         let mut items: Vec<(u64, String)> = Vec::new();
         if !dir.exists() {
@@ -154,6 +192,7 @@ impl Store {
 
     /// The user's acknowledged hosts for this server (empty if none recorded).
     pub fn acks(&self, server: &str) -> Result<Vec<Ack>> {
+        safe_key("server", server)?;
         let path = self.acks_path(server);
         if !path.is_file() {
             return Ok(Vec::new());
@@ -213,15 +252,27 @@ impl Store {
         self.root.join(server).join("baseline")
     }
 
-    /// The version the user accepted as reviewed baseline, if any.
+    /// The version the user accepted as reviewed baseline, if any. A version
+    /// read back from the sidecar is validated before any caller joins it into a
+    /// snapshot path (a hand-edited baseline file is untrusted input too).
     pub fn baseline(&self, server: &str) -> Option<String> {
+        if safe_key("server", server).is_err() {
+            return None;
+        }
         let v = std::fs::read_to_string(self.baseline_path(server)).ok()?;
         let v = v.trim().to_string();
-        (!v.is_empty()).then_some(v)
+        if v.is_empty() || safe_key("version", &v).is_err() {
+            return None;
+        }
+        Some(v)
     }
 
     /// Set (or with `None`, clear) the reviewed-baseline pointer.
     pub fn set_baseline(&self, server: &str, version: Option<&str>) -> Result<()> {
+        safe_key("server", server)?;
+        if let Some(v) = version {
+            safe_key("version", v)?;
+        }
         let path = self.baseline_path(server);
         match version {
             Some(v) => {
@@ -279,6 +330,35 @@ mod tests {
         assert!(store.remove_ack("srv", "cdn.example.net").unwrap());
         assert!(!store.remove_ack("srv", "cdn.example.net").unwrap());
         assert!(store.acks("srv").unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rejects_path_traversal_keys() {
+        let (store, dir) = temp_store("traversal");
+        let evil = Snapshot {
+            server: "../../../../tmp/gurgl-pwn".into(),
+            version: "1.0".into(),
+            captured_at: 0,
+            trials: 1,
+            flightplan: "fp".into(),
+            gurgl_version: "0".into(),
+            hosts: vec![],
+        };
+        assert!(
+            store.save(&evil).is_err(),
+            "traversal server must be refused"
+        );
+        assert!(store.load("..", "1.0").is_err());
+        assert!(store.load("srv", "../secret").is_err());
+        assert!(store.versions("a/b").is_err());
+        assert!(!store.exists("../x", "1.0"));
+        // A safe key still works.
+        let ok = Snapshot {
+            server: "srv".into(),
+            ..evil
+        };
+        assert!(store.save(&ok).is_ok());
         let _ = std::fs::remove_dir_all(dir);
     }
 

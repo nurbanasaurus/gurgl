@@ -484,23 +484,42 @@ fn short(path: &Path) -> String {
 }
 
 /// Render a discovered server as a `[[servers]]` TOML block for import.
+///
+/// Serialized by the `toml` crate, NOT hand-formatted: a server name or arg from
+/// an untrusted client config can contain quotes, backslashes, or control
+/// characters, and Rust's `{:?}` debug escaping is not TOML escaping (it emits
+/// `\u{7f}`-style sequences TOML rejects). Hand-rolling it produced files that
+/// then failed to parse and corrupted `gurgl.toml` on import.
 pub fn to_toml_block(d: &Discovered) -> String {
-    let cmd = d.command.clone().unwrap_or_default();
-    let args = d
-        .args
-        .iter()
-        .map(|a| format!("{a:?}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let mut s = format!(
-        "\n[[servers]]\nname = {:?}\ncommand = {:?}\nargs = [{}]\n",
-        d.name, cmd, args
-    );
+    #[derive(serde::Serialize)]
+    struct Entry<'a> {
+        name: &'a str,
+        command: &'a str,
+        args: &'a [String],
+    }
+    #[derive(serde::Serialize)]
+    struct Wrap<'a> {
+        servers: Vec<Entry<'a>>,
+    }
+    let wrap = Wrap {
+        servers: vec![Entry {
+            name: &d.name,
+            command: d.command.as_deref().unwrap_or_default(),
+            args: &d.args,
+        }],
+    };
+    // toml::to_string of a single-element array-of-tables yields a well-formed
+    // `[[servers]]` block; on the (string-only, never-failing) serialize path an
+    // error can't occur, but default to empty rather than panic.
+    let mut s = format!("\n{}", toml::to_string(&wrap).unwrap_or_default());
     if d.has_env {
         s.push_str(
             "# NOTE: this server sets env (often API keys) in its client config; gurgl does\n",
         );
-        s.push_str("# not copy env yet, so it may need those set in gurgl's environment to run.\n");
+        s.push_str(
+            "# not copy env. Forward specific vars with `pass_env = [\"NAME\"]` on this server,\n",
+        );
+        s.push_str("# or set them in gurgl's own environment, so it can launch.\n");
     }
     s
 }
@@ -570,6 +589,29 @@ mod tests {
         assert_eq!(cfg.servers[0].name, "filesystem");
         assert_eq!(cfg.servers[0].command, "npx");
         assert_eq!(cfg.servers[0].args.len(), 2);
+    }
+
+    #[test]
+    fn toml_block_escapes_hostile_strings_into_valid_toml() {
+        // A name/arg from an untrusted client config with quotes, a backslash,
+        // and a control char. The old `{:?}` hand-formatting emitted invalid
+        // TOML (`\u{7f}`) that corrupted gurgl.toml on import; the toml
+        // serializer must round-trip it exactly.
+        let d = Discovered {
+            name: "evil\"name\u{7f}\\x".into(),
+            command: Some("npx".into()),
+            args: vec!["--flag=\"quoted\"".into(), "tab\there".into()],
+            url: None,
+            has_env: false,
+            source: "Test".into(),
+            status: Status::Configured,
+        };
+        let block = to_toml_block(&d);
+        let cfg: crate::config::Config =
+            toml::from_str(&block).expect("hostile strings must still produce valid TOML");
+        assert_eq!(cfg.servers[0].name, "evil\"name\u{7f}\\x");
+        assert_eq!(cfg.servers[0].args[0], "--flag=\"quoted\"");
+        assert_eq!(cfg.servers[0].args[1], "tab\there");
     }
 
     fn disc(name: &str, source: &str) -> Discovered {

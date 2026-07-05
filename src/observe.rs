@@ -346,6 +346,66 @@ impl Drop for KillOnDrop {
     }
 }
 
+/// A per-trial scratch dir removed when this guard drops - on EVERY exit path
+/// (error, stop, early return), not just the success path. Created with
+/// `create_dir` (never create_dir_all): if the path already exists - a planted
+/// symlink, or a racing local attacker - creation fails atomically instead of
+/// following it. With the unpredictable suffix and 0700 mode, this closes the
+/// symlink / addon-substitution window on the world-writable /tmp.
+struct ScratchDir(PathBuf);
+
+impl ScratchDir {
+    fn new(name_hint: &str) -> Result<Self> {
+        let dir = std::env::temp_dir().join(format!(
+            "gurgl-{}-{}-{}",
+            sanitize(name_hint),
+            std::process::id(),
+            rand_token()
+        ));
+        std::fs::create_dir(&dir)
+            .with_context(|| format!("creating scratch dir {}", dir.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        }
+        Ok(ScratchDir(dir))
+    }
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// An unpredictable per-trial suffix so the scratch path cannot be pre-created
+/// to hijack or DoS the capture. /dev/urandom on unix; a time/pid/counter mix
+/// otherwise (uniqueness still holds; only unpredictability is lost).
+fn rand_token() -> String {
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+            let mut buf = [0u8; 8];
+            if f.read_exact(&mut buf).is_ok() {
+                return buf.iter().map(|b| format!("{b:02x}")).collect();
+            }
+        }
+    }
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    let t = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{t:x}-{n:x}")
+}
+
 /// One trial's outcome.
 struct Trial {
     hosts: Vec<FlowHost>,
@@ -365,14 +425,11 @@ fn run_trial(
     monitor: Monitor,
     reporter: &mut dyn Reporter,
 ) -> Result<Trial> {
-    // Per-trial scratch (its own flow file + addon copy).
-    let tmp = std::env::temp_dir().join(format!(
-        "gurgl-{}-{}-{}",
-        sanitize(&spec.name),
-        std::process::id(),
-        trial
-    ));
-    std::fs::create_dir_all(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+    // Per-trial scratch (its own flow file + addon copy). ScratchDir creates it
+    // with O_EXCL-equivalent semantics (fails rather than following a planted
+    // symlink), owner-only, and removes it on EVERY exit path via Drop.
+    let scratch = ScratchDir::new(&format!("{}-{}", spec.name, trial))?;
+    let tmp = scratch.path();
     let flows_path = tmp.join("flows.jsonl");
     let addon_path = tmp.join("mitm_flows.py");
     std::fs::write(&addon_path, proxy::FLOWS_ADDON).context("writing mitm addon")?;
@@ -414,11 +471,28 @@ fn run_trial(
     let penv = sandbox::ProxyEnv {
         https_proxy: format!("http://127.0.0.1:{port}"),
         ca_cert_path: ca_path.to_string_lossy().to_string(),
-        flowout_path: flows_path.to_string_lossy().to_string(),
     };
-    let argv = sandbox::build_argv(cfg.sandbox, spec, &penv);
-    let server = Command::new(&argv[0])
-        .args(&argv[1..])
+    // Forward only the env vars this server explicitly opted into (pass_env),
+    // read from gurgl's own environment. The sandbox is otherwise env-cleared so
+    // untrusted server code never inherits gurgl's whole environment.
+    let extra_env: Vec<(String, String)> = spec
+        .pass_env
+        .iter()
+        .filter_map(|k| std::env::var(k).ok().map(|v| (k.clone(), v)))
+        .collect();
+    let argv = sandbox::build_argv(cfg.sandbox, spec, &penv, &extra_env);
+    let mut cmd = Command::new(&argv[0]);
+    cmd.args(&argv[1..]);
+    // bwrap (--clearenv) and podman (-e only) isolate the child's environment via
+    // argv. sandbox-exec's child inherits THIS process's environment, so clear it
+    // and set only the capture env plus the forwarded pass_env.
+    if matches!(cfg.sandbox, crate::config::SandboxKind::SandboxExec) {
+        cmd.env_clear();
+        for (k, v) in &extra_env {
+            cmd.env(k, v);
+        }
+    }
+    let server = cmd
         .envs(penv.vars())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -609,7 +683,8 @@ fn run_trial(
     // --- read flows, attribute each host to a phase by timestamp ---
     let raw = proxy::parse_flows(&flows_path)?;
     let hosts = attribute_phases(raw, &phase_marks);
-    let _ = std::fs::remove_dir_all(&tmp);
+    // `scratch` (the ScratchDir guard) removes the temp dir on drop at end of
+    // scope, including every early-return above - no manual cleanup needed.
     Ok(Trial {
         hosts,
         server_version,

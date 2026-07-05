@@ -27,8 +27,6 @@ pub struct ProxyEnv {
     pub https_proxy: String,
     /// Absolute path to the lab CA cert (PEM) inside the sandbox.
     pub ca_cert_path: String,
-    /// Absolute path the mitmproxy addon appends flow records to.
-    pub flowout_path: String,
 }
 
 impl ProxyEnv {
@@ -68,8 +66,11 @@ impl ProxyEnv {
             ("SSL_CERT_FILE".into(), self.ca_cert_path.clone()),
             ("REQUESTS_CA_BUNDLE".into(), self.ca_cert_path.clone()),
             ("CURL_CA_BUNDLE".into(), self.ca_cert_path.clone()),
-            // gurgl addon coordination:
-            ("GURGL_FLOWOUT".into(), self.flowout_path.clone()),
+            // NOTE: GURGL_FLOWOUT is deliberately NOT set here. Only the
+            // mitmproxy addon reads it, and it runs OUTSIDE the sandbox (gurgl
+            // sets it on the mitmdump process directly). Injecting it into the
+            // observed server served no purpose and advertised the exact path of
+            // the evidence file, plus a "you are under gurgl" fingerprint.
         ]
     }
 }
@@ -77,10 +78,19 @@ impl ProxyEnv {
 /// Build the argv to launch `spec` under the chosen sandbox backend.
 ///
 /// The returned vector is a full command line: `argv[0]` is the sandbox binary.
-pub fn build_argv(kind: SandboxKind, spec: &ServerSpec, env: &ProxyEnv) -> Vec<String> {
+/// `extra_env` is the resolved `pass_env` forwarding (var name -> value read
+/// from gurgl's own environment). bwrap and podman set the child's environment
+/// from argv, so it is threaded in here; sandbox-exec's child inherits the
+/// caller's environment, so gurgl clears and re-sets that at spawn time instead.
+pub fn build_argv(
+    kind: SandboxKind,
+    spec: &ServerSpec,
+    env: &ProxyEnv,
+    extra_env: &[(String, String)],
+) -> Vec<String> {
     match kind {
-        SandboxKind::Bubblewrap => build_bwrap_argv(spec, env),
-        SandboxKind::Podman => build_podman_argv(spec, env),
+        SandboxKind::Bubblewrap => build_bwrap_argv(spec, env, extra_env),
+        SandboxKind::Podman => build_podman_argv(spec, env, extra_env),
         SandboxKind::SandboxExec => build_sandbox_exec_argv(spec, env),
     }
 }
@@ -106,9 +116,20 @@ fn build_sandbox_exec_argv(spec: &ServerSpec, _env: &ProxyEnv) -> Vec<String> {
     argv
 }
 
-fn build_bwrap_argv(spec: &ServerSpec, env: &ProxyEnv) -> Vec<String> {
+fn build_bwrap_argv(
+    spec: &ServerSpec,
+    env: &ProxyEnv,
+    extra_env: &[(String, String)],
+) -> Vec<String> {
     let mut argv = vec![
         "bwrap".to_string(),
+        // Start the child from an EMPTY environment: bwrap otherwise passes
+        // gurgl's whole environment through, handing exported secrets (AWS keys,
+        // GITHUB_TOKEN, ...) to third-party code gurgl itself warns is downloaded
+        // and executed as part of the capture. Everything the child legitimately
+        // needs is re-set via --setenv below (and opt-in pass_env). Must precede
+        // the --setenv args to not wipe them.
+        "--clearenv".into(),
         "--ro-bind".into(),
         "/usr".into(),
         "/usr".into(),
@@ -163,7 +184,12 @@ fn build_bwrap_argv(spec: &ServerSpec, env: &ProxyEnv) -> Vec<String> {
     // sandbox. Read-only; -try tolerates absence. (The sandbox is not a security
     // boundary yet; see the module docs and docs/THREAT-MODEL.md.)
     if let Some(home) = dirs::home_dir() {
-        for sub in [".local", ".gurgl", ".nvm", ".volta", ".asdf", ".fnm"] {
+        // Bind ONLY ~/.gurgl/bin, not all of ~/.gurgl: the parent also holds the
+        // mitmproxy CA PRIVATE key, every prior snapshot (the egress inventory of
+        // every server captured), and the review sidecars - none of which the
+        // observed server should read. The public CA cert it needs is bound
+        // separately above via env.ca_cert_path.
+        for sub in [".local", ".gurgl/bin", ".nvm", ".volta", ".asdf", ".fnm"] {
             let p = home.join(sub).to_string_lossy().to_string();
             argv.push("--ro-bind-try".into());
             argv.push(p.clone());
@@ -175,26 +201,52 @@ fn build_bwrap_argv(spec: &ServerSpec, env: &ProxyEnv) -> Vec<String> {
         argv.push(k);
         argv.push(v);
     }
+    // Opt-in forwarded env (pass_env), set last so it can supply e.g. an API key
+    // the server needs without reopening the whole environment.
+    for (k, v) in extra_env {
+        argv.push("--setenv".into());
+        argv.push(k.clone());
+        argv.push(v.clone());
+    }
     argv.push("--".into());
     argv.push(spec.command.clone());
     argv.extend(spec.args.iter().cloned());
     argv
 }
 
-fn build_podman_argv(spec: &ServerSpec, env: &ProxyEnv) -> Vec<String> {
+fn build_podman_argv(
+    spec: &ServerSpec,
+    env: &ProxyEnv,
+    extra_env: &[(String, String)],
+) -> Vec<String> {
     let mut argv = vec![
         "podman".to_string(),
         "run".into(),
         "--rm".into(),
         "-i".into(),
+        // Share the host network namespace so the container reaches the capture
+        // proxy on 127.0.0.1 - the same model as bwrap, which deliberately does
+        // not unshare-net. A private netns (the old `slirp4netns`) made the
+        // container's 127.0.0.1 its OWN loopback with the host proxy
+        // unreachable, so every capture was silently empty.
         "--network".into(),
-        "slirp4netns".into(),
+        "host".into(),
+        // Never pull implicitly: a silent docker.io fetch inside `watch` would be
+        // undisclosed, gurgl-initiated network access (constraint #5). If the
+        // image is absent, podman errors and the user pulls it explicitly.
+        "--pull=never".into(),
+        // The lab CA, read-only. The flow log is written host-side by the
+        // mitmdump addon, so it is deliberately NOT mounted into the container.
         "-v".into(),
         format!("{}:{}:ro", env.ca_cert_path, env.ca_cert_path),
-        "-v".into(),
-        format!("{}:{}", env.flowout_path, env.flowout_path),
     ];
+    // podman does not pass host env to the container by default; -e is the only
+    // way in, so nothing leaks that we do not name here.
     for (k, v) in env.vars() {
+        argv.push("-e".into());
+        argv.push(format!("{k}={v}"));
+    }
+    for (k, v) in extra_env {
         argv.push("-e".into());
         argv.push(format!("{k}={v}"));
     }
@@ -229,6 +281,7 @@ mod tests {
             version: None,
             first_party: vec![],
             flightplan: None,
+            pass_env: vec![],
         }
     }
 
@@ -236,13 +289,12 @@ mod tests {
         ProxyEnv {
             https_proxy: "http://127.0.0.1:8080".into(),
             ca_cert_path: "/tmp/gurgl-ca.pem".into(),
-            flowout_path: "/tmp/gurgl-flows.jsonl".into(),
         }
     }
 
     #[test]
     fn bwrap_argv_has_command_after_separator() {
-        let argv = build_argv(SandboxKind::Bubblewrap, &spec(), &env());
+        let argv = build_argv(SandboxKind::Bubblewrap, &spec(), &env(), &[]);
         assert_eq!(argv[0], "bwrap");
         let sep = argv.iter().position(|a| a == "--").unwrap();
         assert_eq!(argv[sep + 1], "npx");
@@ -250,15 +302,61 @@ mod tests {
     }
 
     #[test]
+    fn bwrap_clears_env_before_setting_it() {
+        // --clearenv must appear, and before any --setenv, or it wipes the vars
+        // gurgl set (the sandboxed child would then get an empty environment).
+        let argv = build_argv(SandboxKind::Bubblewrap, &spec(), &env(), &[]);
+        let clear = argv
+            .iter()
+            .position(|a| a == "--clearenv")
+            .expect("clearenv present");
+        let first_setenv = argv
+            .iter()
+            .position(|a| a == "--setenv")
+            .expect("a setenv present");
+        assert!(clear < first_setenv, "--clearenv must precede --setenv");
+        // The CA private key dir (~/.gurgl) must not be bound wholesale; only bin.
+        assert!(
+            !argv.iter().any(|a| a.ends_with("/.gurgl")),
+            "must not ro-bind all of ~/.gurgl"
+        );
+    }
+
+    #[test]
+    fn bwrap_forwards_pass_env() {
+        let extra = vec![("MY_TOKEN".to_string(), "s3cr3t".to_string())];
+        let argv = build_argv(SandboxKind::Bubblewrap, &spec(), &env(), &extra);
+        assert!(argv
+            .windows(3)
+            .any(|w| w[0] == "--setenv" && w[1] == "MY_TOKEN" && w[2] == "s3cr3t"));
+    }
+
+    #[test]
     fn podman_argv_passes_env() {
-        let argv = build_argv(SandboxKind::Podman, &spec(), &env());
+        let argv = build_argv(SandboxKind::Podman, &spec(), &env(), &[]);
         assert_eq!(argv[0], "podman");
         assert!(argv.iter().any(|a| a.starts_with("HTTPS_PROXY=")));
     }
 
     #[test]
+    fn podman_uses_host_network_and_no_flow_mount() {
+        // The container must reach the host proxy on 127.0.0.1 (host network),
+        // never a private netns; and it must not mount the flow log (host-side).
+        let argv = build_argv(SandboxKind::Podman, &spec(), &env(), &[]);
+        assert!(argv
+            .windows(2)
+            .any(|w| w[0] == "--network" && w[1] == "host"));
+        assert!(!argv.iter().any(|a| a.contains("slirp4netns")));
+        assert!(argv.iter().any(|a| a == "--pull=never"));
+        assert!(
+            !argv.iter().any(|a| a.contains("flows")),
+            "flow log must not be mounted into the container"
+        );
+    }
+
+    #[test]
     fn sandbox_exec_argv_has_profile_and_command() {
-        let argv = build_argv(SandboxKind::SandboxExec, &spec(), &env());
+        let argv = build_argv(SandboxKind::SandboxExec, &spec(), &env(), &[]);
         assert_eq!(argv[0], "sandbox-exec");
         assert!(argv.iter().any(|a| a == "-p"));
         let sep = argv.iter().position(|a| a == "--").unwrap();

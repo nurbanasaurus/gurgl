@@ -51,6 +51,14 @@ pub struct ServerSpec {
     /// resolve against the config file's directory.
     #[serde(default)]
     pub flightplan: Option<String>,
+    /// Names of environment variables to forward from gurgl's own environment
+    /// into this server's sandbox. The sandbox is otherwise env-cleared so
+    /// untrusted server code never inherits gurgl's whole environment (AWS keys,
+    /// tokens, ...). List only the vars this server legitimately needs, e.g.
+    /// `pass_env = ["GITHUB_TOKEN"]`. gurgl reads the value from its own
+    /// environment at capture time; it is never stored.
+    #[serde(default)]
+    pub pass_env: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -234,6 +242,10 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp/gurgl-scratch"]
 # name = "some-other-mcp"
 # command = "npx"
 # args = ["-y", "some-other-mcp"]
+# The sandbox is env-cleared so untrusted server code never inherits gurgl's
+# whole environment. If a server needs specific vars (e.g. an API key) to run,
+# forward just those from gurgl's own environment:
+# pass_env = ["SOME_API_KEY"]
 "#;
 
 #[cfg(test)]

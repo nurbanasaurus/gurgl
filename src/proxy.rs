@@ -72,11 +72,19 @@ pub fn parse_flows(path: &Path) -> Result<Vec<RawFlow>> {
         let Some(host) = val.get("host").and_then(|h| h.as_str()) else {
             continue;
         };
-        // Normalize: lowercase, and strip a trailing FQDN root dot so
-        // "api.example.com." and "api.example.com" are one host, not two (an
-        // unnormalized split would put the same host in different trials and
-        // wrongly demote it below the reproduction gate).
-        let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+        // Normalize a host that is attacker-influenced (the observed server
+        // chooses what it connects to): strip ASCII/Unicode control characters
+        // so a hostname carrying an ANSI escape can't spoof or corrupt the
+        // terminal when shown, or the store when written; lowercase; and strip a
+        // trailing FQDN root dot so "api.example.com." and "api.example.com" are
+        // one host, not two split across trials below the reproduction gate.
+        let host: String = host
+            .trim()
+            .trim_end_matches('.')
+            .chars()
+            .filter(|c| !c.is_control())
+            .collect::<String>()
+            .to_ascii_lowercase();
         if host.is_empty() {
             continue;
         }
@@ -119,6 +127,20 @@ mod tests {
         assert_eq!(flows[0].host, "api.example.com");
         assert_eq!(flows[0].time, 1000.5);
         assert_eq!(flows[1].host, "beacon.unknown.example");
+    }
+
+    #[test]
+    fn parse_flows_strips_control_characters() {
+        // A host carrying an ANSI escape (JSON \u001b decodes to a raw ESC
+        // byte) must not reach the terminal or store intact - it is stripped.
+        let mut f = tempfile();
+        let line = r#"{"host":"\u001bevil.example","time":1.0}"#;
+        writeln!(f.0, "{line}").unwrap();
+        f.0.flush().unwrap();
+        let flows = parse_flows(&f.1).unwrap();
+        assert_eq!(flows.len(), 1);
+        assert!(!flows[0].host.contains('\u{1b}'));
+        assert_eq!(flows[0].host, "evil.example");
     }
 
     #[test]

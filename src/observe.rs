@@ -136,7 +136,15 @@ pub fn aggregate(trials: &[Vec<FlowHost>], first_party: &[String]) -> Vec<Host> 
 
     acc.into_iter()
         .map(|(name, (count, phases))| {
-            let reproducibility = if n > 0 && count >= n {
+            // The reproduction gate needs at least two trials to mean anything:
+            // with one observation a host is neither confirmed reproducible nor
+            // provably cohort noise, so it is `Observed`, not `Stable`. This is
+            // what keeps a `watch --for`/`--until-closed` hold (always one long
+            // run) or a `trials = 1` config from reporting single sightings as
+            // reproduced facts through diff/drift/allow.
+            let reproducibility = if n < 2 {
+                Reproducibility::Observed
+            } else if count >= n {
                 Reproducibility::Stable
             } else {
                 Reproducibility::Intermittent
@@ -382,17 +390,23 @@ fn run_trial(
         &confdir.to_string_lossy(),
         port,
     );
-    let proxy_child = Command::new(&proxy_argv[0])
+    let mut proxy_child = Command::new(&proxy_argv[0])
         .args(&proxy_argv[1..])
         .env("GURGL_FLOWOUT", &flows_path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("spawning {}", cfg.mitmdump))?;
-    let proxy_guard = KillOnDrop(proxy_child);
+    // Keep mitmdump's stderr tail. A dead or misconfigured proxy is the classic
+    // way a capture silently records nothing and then reads as "no egress"; its
+    // last lines are the diagnosis. Discarding them (the old Stdio::null) is
+    // what made proxy failure invisible.
+    let proxy_stderr_tail = drain_stderr_tail(proxy_child.stderr.take());
+    let mut proxy_guard = KillOnDrop(proxy_child);
 
-    wait_for_port(port, Duration::from_secs(20)).context("mitmdump did not start listening")?;
+    wait_for_port(port, Duration::from_secs(20))
+        .with_context(|| proxy_start_failure(&proxy_stderr_tail))?;
     wait_for_file(&ca_path, Duration::from_secs(15))
         .context("mitmproxy CA cert was not generated")?;
 
@@ -426,20 +440,7 @@ fn run_trial(
         .context("server stdout unavailable")?;
     // Keep the tail of the server's stderr (drained so the pipe never blocks):
     // when the server dies mid-capture, its last lines are the diagnosis.
-    let stderr_tail: std::sync::Arc<Mutex<std::collections::VecDeque<String>>> =
-        std::sync::Arc::new(Mutex::new(std::collections::VecDeque::new()));
-    if let Some(stderr) = server_guard.0.stderr.take() {
-        let tail = stderr_tail.clone();
-        thread::spawn(move || {
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                let mut t = tail.lock().unwrap_or_else(|e| e.into_inner());
-                if t.len() >= 8 {
-                    t.pop_front();
-                }
-                t.push_back(line);
-            }
-        });
-    }
+    let stderr_tail = drain_stderr_tail(server_guard.0.stderr.take());
     let rx = spawn_line_reader(stdout);
 
     // --- drive the flight plan, marking when each phase begins ---
@@ -460,17 +461,18 @@ fn run_trial(
         if stop_requested() {
             break;
         }
-        // A battery trial requires a live server for the whole plan. Without
-        // this check, a server that crashes at launch (missing API key, bad
-        // runtime) "completes" every step via timeouts and saves an EMPTY
-        // snapshot that reads as "no egress observed" - a false observation.
-        // Hold mode keeps its own softer exit (a monitor ends when the server
-        // does).
-        if matches!(monitor, Monitor::Battery) {
-            if let Ok(Some(status)) = server_guard.0.try_wait() {
-                bail!("{}", dead_server_msg(&status, &step.phase, &stderr_tail));
-            }
+        // A live server AND a live proxy are preconditions for a trustworthy
+        // capture, in EVERY mode. A server that crashes at launch (missing API
+        // key, bad runtime) would otherwise "complete" every step via timeouts
+        // and save an EMPTY snapshot reading as "no egress observed"; a dead
+        // proxy drops egress the same silent way. Both become errors carrying
+        // their stderr tail, never a false-clean snapshot. Hold mode's softer
+        // server exit is allowed only later, in the monitor phase, once the
+        // scripted plan has actually run.
+        if let Ok(Some(status)) = server_guard.0.try_wait() {
+            bail!("{}", dead_server_msg(&status, &step.phase, &stderr_tail));
         }
+        check_proxy_alive(&mut proxy_guard.0, &step.phase, &proxy_stderr_tail)?;
         phase_marks.push((now_epoch(), step.phase.clone()));
         reporter.phase(&step.phase);
         match step.action.as_str() {
@@ -530,13 +532,18 @@ fn run_trial(
 
     // Catch a crash during the plan's FINAL step too (the boundary check above
     // only runs before each step): a dead server did not complete the method.
-    if matches!(monitor, Monitor::Battery) && !stop_requested() {
-        if let Ok(Some(status)) = server_guard.0.try_wait() {
-            let phase = phase_marks
-                .last()
-                .map(|(_, p)| p.as_str())
-                .unwrap_or("startup");
-            bail!("{}", dead_server_msg(&status, phase, &stderr_tail));
+    let last_phase = phase_marks
+        .last()
+        .map(|(_, p)| p.as_str())
+        .unwrap_or("startup");
+    if !stop_requested() {
+        // A dead proxy at the end means the flows we hold may be incomplete, in
+        // any mode - never save that as a snapshot.
+        check_proxy_alive(&mut proxy_guard.0, last_phase, &proxy_stderr_tail)?;
+        if matches!(monitor, Monitor::Battery) {
+            if let Ok(Some(status)) = server_guard.0.try_wait() {
+                bail!("{}", dead_server_msg(&status, last_phase, &stderr_tail));
+            }
         }
     }
 
@@ -578,6 +585,9 @@ fn run_trial(
                 reporter.note("server process exited; ending watch");
                 break;
             }
+            // A dead proxy during the hold is a fidelity failure, not a normal
+            // end: error out rather than keep "watching" blind.
+            check_proxy_alive(&mut proxy_guard.0, phase, &proxy_stderr_tail)?;
             thread::sleep(Duration::from_millis(200));
             surface_hosts(
                 &flows_path,
@@ -616,22 +626,94 @@ fn dead_server_msg(
     phase: &str,
     stderr_tail: &Mutex<std::collections::VecDeque<String>>,
 ) -> String {
-    let tail: Vec<String> = stderr_tail
+    format!(
+        "server exited ({status}) mid-capture (detected at '{phase}') - nothing was \
+         captured (an empty snapshot would falsely read as \"no egress observed\").{}\n  \
+         common causes: the server needs env vars (often API keys) from its client config, \
+         which gurgl does not copy - set them in gurgl's environment; or its \
+         runtime/arguments are wrong for this machine.",
+        stderr_diag(stderr_tail)
+    )
+}
+
+/// Compose the error for a capture proxy that died mid-capture. A dead mitmdump
+/// means some egress may have gone unrecorded, so the trial is void: reporting
+/// an empty snapshot here would be a false "no egress observed".
+fn proxy_dead_msg(
+    status: &std::process::ExitStatus,
+    phase: &str,
+    tail: &Mutex<std::collections::VecDeque<String>>,
+) -> String {
+    format!(
+        "capture proxy (mitmdump) exited ({status}) mid-capture (detected at '{phase}') - the \
+         trial cannot be trusted: some egress may have gone unrecorded, which an empty snapshot \
+         would falsely read as \"no egress observed\".{}\n  common causes: a stale mitmproxy \
+         after a Python upgrade (reinstall: {}), the listen port was taken by another process, \
+         or the addon failed to load.",
+        stderr_diag(tail),
+        mitmproxy_fix()
+    )
+}
+
+/// Error out if the capture proxy has already exited on its own. Called at every
+/// step boundary and during the hold, so a dead proxy stops the trial with a
+/// diagnosis instead of yielding a silent, empty, false-clean capture.
+fn check_proxy_alive(
+    proxy: &mut Child,
+    phase: &str,
+    tail: &Mutex<std::collections::VecDeque<String>>,
+) -> Result<()> {
+    if let Ok(Some(status)) = proxy.try_wait() {
+        bail!("{}", proxy_dead_msg(&status, phase, tail));
+    }
+    Ok(())
+}
+
+/// Context for `wait_for_port` failing to see mitmdump come up: fold in its
+/// stderr so a broken install reads as a fixable diagnosis, not "nothing
+/// listening".
+fn proxy_start_failure(tail: &Mutex<std::collections::VecDeque<String>>) -> String {
+    format!(
+        "mitmdump did not start listening.{}\n  reinstall it with: {}",
+        stderr_diag(tail),
+        mitmproxy_fix()
+    )
+}
+
+/// Spawn a thread draining a child's stderr into a bounded tail (its last 8
+/// lines) so the pipe never blocks the child and the last lines survive to
+/// diagnose a mid-capture death. Shared by the server and the proxy.
+fn drain_stderr_tail(
+    stderr: Option<impl std::io::Read + Send + 'static>,
+) -> std::sync::Arc<Mutex<std::collections::VecDeque<String>>> {
+    let tail = std::sync::Arc::new(Mutex::new(std::collections::VecDeque::new()));
+    if let Some(stderr) = stderr {
+        let t = tail.clone();
+        thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                let mut g = t.lock().unwrap_or_else(|e| e.into_inner());
+                if g.len() >= 8 {
+                    g.pop_front();
+                }
+                g.push_back(line);
+            }
+        });
+    }
+    tail
+}
+
+/// The "last stderr lines" fragment shared by the dead-server and dead-proxy
+/// diagnostics.
+fn stderr_diag(tail: &Mutex<std::collections::VecDeque<String>>) -> String {
+    let lines: Vec<String> = tail
         .lock()
         .map(|t| t.iter().rev().take(3).rev().cloned().collect())
         .unwrap_or_default();
-    let diag = if tail.is_empty() {
+    if lines.is_empty() {
         String::from(" It printed nothing on stderr.")
     } else {
-        format!("\n  its last stderr lines:\n    {}", tail.join("\n    "))
-    };
-    format!(
-        "server exited ({status}) mid-capture (detected at '{phase}') - nothing was \
-         captured (an empty snapshot would falsely read as \"no egress observed\").{diag}\n  \
-         common causes: the server needs env vars (often API keys) from its client config, \
-         which gurgl does not copy - set them in gurgl's environment; or its \
-         runtime/arguments are wrong for this machine."
-    )
+        format!("\n  its last stderr lines:\n    {}", lines.join("\n    "))
+    }
 }
 
 /// Make a server-reported version safe to use as a snapshot filename, keeping
@@ -894,6 +976,20 @@ mod tests {
         let gate = hosts.iter().find(|h| h.name == "featuregates.org").unwrap();
         assert_eq!(gate.reproducibility, Reproducibility::Intermittent); // 2/3 -> cohort noise
         assert_eq!(gate.class, HostClass::Telemetry);
+    }
+
+    #[test]
+    fn single_observation_is_observed_not_stable() {
+        // One trial (a Hold watch, or trials=1) can never satisfy the gate: the
+        // host is Observed, so downstream stable-only filters exclude it from
+        // findings, drift, and allowlists. Marking it Stable would report a
+        // single sighting as a reproduced fact.
+        let trials = vec![vec![fh("beacon.unknown.example", "monitor")]];
+        let hosts = aggregate(&trials, &[]);
+        let h = &hosts[0];
+        assert_eq!(h.reproducibility, Reproducibility::Observed);
+        assert_ne!(h.reproducibility, Reproducibility::Stable);
+        assert_eq!(h.seen_in_trials, 1);
     }
 
     #[test]

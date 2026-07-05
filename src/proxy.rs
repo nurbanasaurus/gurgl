@@ -72,7 +72,11 @@ pub fn parse_flows(path: &Path) -> Result<Vec<RawFlow>> {
         let Some(host) = val.get("host").and_then(|h| h.as_str()) else {
             continue;
         };
-        let host = host.trim().to_ascii_lowercase();
+        // Normalize: lowercase, and strip a trailing FQDN root dot so
+        // "api.example.com." and "api.example.com" are one host, not two (an
+        // unnormalized split would put the same host in different trials and
+        // wrongly demote it below the reproduction gate).
+        let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
         if host.is_empty() {
             continue;
         }
@@ -115,6 +119,20 @@ mod tests {
         assert_eq!(flows[0].host, "api.example.com");
         assert_eq!(flows[0].time, 1000.5);
         assert_eq!(flows[1].host, "beacon.unknown.example");
+    }
+
+    #[test]
+    fn parse_flows_normalizes_trailing_dot() {
+        // A resolver / client that emits the FQDN root dot must not split the
+        // host from its dotless form across trials.
+        let mut f = tempfile();
+        writeln!(f.0, r#"{{"host":"API.Example.com.","time":1.0}}"#).unwrap();
+        writeln!(f.0, r#"{{"host":"api.example.com","time":2.0}}"#).unwrap();
+        f.0.flush().unwrap();
+        let flows = parse_flows(&f.1).unwrap();
+        assert_eq!(flows.len(), 2);
+        assert_eq!(flows[0].host, "api.example.com");
+        assert_eq!(flows[1].host, "api.example.com");
     }
 
     // Tiny temp-file helper to avoid a dev-dependency.

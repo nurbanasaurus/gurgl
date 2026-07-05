@@ -434,12 +434,23 @@ fn cmd_show(store: &Store, server: &str, version: Option<&str>, json: bool) -> R
         for c in &classes {
             println!("  {:<12} {}", c, class_legend(c));
         }
-        println!(
-            "  {:<12} SEEN n/{}: appeared in n of the {} trials. stable = every trial; \
-             intermittent = some\n  {:<12} trials only (usually server-side cohort noise, \
-             not a change in the tool).",
-            "repro", snap.trials, snap.trials, ""
-        );
+        if snap.trials < 2 {
+            // One observation: the reproduction gate never ran, so nothing here
+            // is "stable". Say so rather than implying a battery happened.
+            println!(
+                "  {:<12} this was a single observation ({} trial), so hosts are `observed`,\n  \
+                 {:<12} not `stable`: reproducibility is untested. Run `gurgl watch {}` a few\n  \
+                 {:<12} times for a battery that can confirm which hosts reproduce.",
+                "repro", snap.trials, "", server, ""
+            );
+        } else {
+            println!(
+                "  {:<12} SEEN n/{}: appeared in n of the {} trials. stable = every trial; \
+                 intermittent = some\n  {:<12} trials only (usually server-side cohort noise, \
+                 not a change in the tool).",
+                "repro", snap.trials, snap.trials, ""
+            );
+        }
     }
     println!(
         "\nnote: presence only - hosts observed under this flight plan. Absence of a host \
@@ -562,10 +573,14 @@ fn cmd_diff(
         } else {
             println!("  new hosts:");
             for delta in &d.added {
-                let flag = if delta.reproducibility == Reproducibility::Stable {
-                    "" // stable: a real change
-                } else {
-                    "  (intermittent - likely cohort noise, not a finding)"
+                let flag = match delta.reproducibility {
+                    Reproducibility::Stable => "", // stable: a real change
+                    Reproducibility::Observed => {
+                        "  (single observation - reproducibility untested, not a finding)"
+                    }
+                    Reproducibility::Intermittent => {
+                        "  (intermittent - likely cohort noise, not a finding)"
+                    }
                 };
                 println!("    + {:<40} [{}]{}", delta.name, delta.class, flag);
             }
@@ -1088,15 +1103,25 @@ fn host_story(h: &model::Host, trials: u32, acks: &[store::Ack]) -> String {
     } else {
         format!("during {}", h.phases.join(" and "))
     };
-    let seen = if h.reproducibility == model::Reproducibility::Stable {
-        format!("in every one of the {trials} run(s) - reproducible")
-    } else {
-        format!(
+    let seen = match h.reproducibility {
+        model::Reproducibility::Stable => {
+            format!("in every one of the {trials} run(s) - reproducible")
+        }
+        model::Reproducibility::Observed => {
+            // A single observation: seen, but the gate could not be applied.
+            // Do not call it cohort noise (that needs a battery to establish),
+            // and do not call it a reproduced fact either.
+            "in a single observation - reproducibility untested (this was one long watch, \
+             not a repeated battery); run `gurgl watch` a few times to confirm whether it \
+             is stable"
+                .to_string()
+        }
+        model::Reproducibility::Intermittent => format!(
             "in only {} of {trials} runs - NOT reproducible, which usually means server-side \
              A/B or feature-gate noise rather than a change in the tool; gurgl deliberately \
              does not treat it as a finding",
             h.seen_in_trials
-        )
+        ),
     };
     let what = match h.class {
         model::HostClass::FirstParty => {
@@ -1527,6 +1552,7 @@ fn repro_str(r: Reproducibility) -> &'static str {
     match r {
         Reproducibility::Stable => "stable",
         Reproducibility::Intermittent => "intermittent",
+        Reproducibility::Observed => "observed",
     }
 }
 

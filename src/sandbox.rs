@@ -54,6 +54,11 @@ impl ProxyEnv {
             ("https_proxy".into(), self.https_proxy.clone()),
             ("http_proxy".into(), self.https_proxy.clone()),
             ("all_proxy".into(), self.https_proxy.clone()),
+            // Explicitly empty NO_PROXY so an inherited value (or one a client
+            // sets by default) cannot carve out hosts that then egress
+            // unobserved. Empty = no bypass exceptions; capture everything.
+            ("NO_PROXY".into(), String::new()),
+            ("no_proxy".into(), String::new()),
             // Node ignores proxy env vars by default. This (Node 24+) makes its
             // core http/https client AND fetch honor them; harmless on older Node.
             // Verified: without it, node egress bypasses the proxy entirely.

@@ -59,11 +59,19 @@ impl std::fmt::Display for HostClass {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Reproducibility {
-    /// Appeared in every trial. Reportable.
+    /// Appeared in every trial of a battery of two or more. Reportable.
     Stable,
     /// Appeared in some but not all trials. Likely cohort/feature-gated noise;
     /// never publish as a bare fact, never emit as a drift accusation.
     Intermittent,
+    /// Seen in a single observation (a `watch --for`/`--until-closed` hold, or a
+    /// battery of fewer than two completed trials), so the reproduction gate
+    /// could not be applied at all: not cohort noise, but not confirmed
+    /// reproducible either. Treated like Intermittent by every findings, drift,
+    /// and allowlist path (only `Stable` earns those) - run a battery of two or
+    /// more trials to promote it. Reporting a single sighting as a fact is
+    /// exactly the over-claim the gate exists to prevent.
+    Observed,
 }
 
 /// One observed egress destination for a server@version, aggregated over trials.

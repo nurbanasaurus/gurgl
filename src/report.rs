@@ -350,6 +350,7 @@ impl Reporter for DashboardReporter {
             let repro = match h.reproducibility {
                 Reproducibility::Stable => "stable",
                 Reproducibility::Intermittent => "intermittent",
+                Reproducibility::Observed => "observed",
             };
             let name = truncate(&h.name, 40);
             let cls = format!("{:<11}", h.class);

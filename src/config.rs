@@ -77,6 +77,13 @@ pub struct Config {
     /// Trials per capture (the reproduction gate). Higher = less cohort noise.
     #[serde(default = "default_trials")]
     pub trials: u32,
+    /// Capture strategy. `env-proxy` (default) relies on the server honoring proxy
+    /// env vars. `forced` routes ALL of the server's TCP egress through the proxy
+    /// via a network namespace + transparent redirect (Linux + bubblewrap only;
+    /// needs pasta/nftables/uidmap - see `gurgl doctor`). `watch --forced`
+    /// overrides this per run.
+    #[serde(default)]
+    pub capture: crate::model::CaptureMode,
     #[serde(default)]
     pub servers: Vec<ServerSpec>,
 
@@ -105,6 +112,7 @@ impl Default for Config {
             mitmdump: default_mitmdump(),
             flightplan: default_flightplan(),
             trials: default_trials(),
+            capture: crate::model::CaptureMode::default(),
             servers: Vec::new(),
             base_dir: None,
         }
@@ -229,6 +237,13 @@ flightplan = "flightplans/default.toml"
 # Trials per capture. Repeated runs let gurgl separate stable egress from
 # server-side cohort/feature-gate noise (the reproduction gate).
 trials = 5
+
+# Capture strategy. "env-proxy" (default) trusts the server to honor proxy env
+# vars; a client that opens raw sockets or pins certs escapes it. "forced" routes
+# ALL of the server's TCP egress through the proxy with a network namespace +
+# transparent redirect (Linux + bubblewrap only; needs pasta, nftables, uidmap -
+# run `gurgl doctor`). `gurgl watch --forced` overrides this per run.
+# capture = "env-proxy"
 
 # --- the servers you want to watch ---------------------------------------
 

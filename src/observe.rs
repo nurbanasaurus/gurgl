@@ -230,6 +230,353 @@ fn mitmproxy_fix() -> String {
         .to_string()
 }
 
+/// Preflight for FORCED capture (opt-in): it needs Linux + bubblewrap and a
+/// specific rootless toolchain (userspace netns egress, nftables, and `uidmap`
+/// for the second uid that lets nftables tell the proxy from the server). Every
+/// failure names the exact fix, so an opt-in that can't run here is a clear error
+/// rather than a silent fall back to weaker env-proxy capture (which must never be
+/// mislabeled Forced).
+pub fn preflight_forced(cfg: &Config) -> Result<()> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = cfg;
+        bail!("forced capture is Linux-only (it uses network namespaces + nftables). Drop `capture = \"forced\"` / `--forced` on this OS.");
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if !matches!(cfg.sandbox, crate::config::SandboxKind::Bubblewrap) {
+            bail!(
+                "forced capture requires the bubblewrap sandbox (it runs bwrap inside the capture \
+                 network namespace); `sandbox` is set to something else. Set sandbox = \"bubblewrap\" \
+                 to use forced capture, or drop the forced request."
+            );
+        }
+        // The userspace egress helper, the redirect engine, and the namespace
+        // tools. `newuidmap` (from `uidmap`) is what maps the SECOND uid the
+        // exclusion rule needs; without it only a single-uid userns is possible
+        // and the proxy would redirect its own upstream into a loop.
+        let mut missing: Vec<(&str, &str)> = Vec::new();
+        if !on_path("pasta") && !on_path("slirp4netns") {
+            missing.push((
+                "pasta (or slirp4netns)",
+                "sudo apt-get install -y passt   # userspace netns egress",
+            ));
+        }
+        if !on_path("nft") {
+            missing.push(("nft", "sudo apt-get install -y nftables"));
+        }
+        if !on_path("newuidmap") {
+            missing.push((
+                "newuidmap",
+                "sudo apt-get install -y uidmap   # the second uid the redirect exclusion needs",
+            ));
+        }
+        for bin in ["unshare", "nsenter", "setpriv"] {
+            if !on_path(bin) {
+                missing.push((
+                    "util-linux tools (unshare/nsenter/setpriv)",
+                    "sudo apt-get install -y util-linux",
+                ));
+                break;
+            }
+        }
+        if !missing.is_empty() {
+            let list = missing
+                .iter()
+                .map(|(what, fix)| format!("  - {what}\n      fix: {fix}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            bail!("forced capture needs tools this machine is missing:\n{list}\n(`gurgl doctor` previews forced-capture readiness.)");
+        }
+        // Unprivileged user namespaces must be allowed (Ubuntu 23.10+ can block
+        // them via AppArmor); the whole design hinges on owning a rootless netns.
+        if std::fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
+            .ok()
+            .map(|s| s.trim() == "1")
+            == Some(true)
+        {
+            bail!(
+                "forced capture needs unprivileged user namespaces, but they are restricted by \
+                   AppArmor (kernel.apparmor_restrict_unprivileged_userns=1). Allow them or use \
+                   env-proxy capture."
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Forced-capture network-namespace orchestration (Linux only). Encapsulates the
+/// rootless userns+netns holder, the `pasta` userspace egress into it, the
+/// `nsenter` wrappers that run the proxy (as the launcher uid) and the server (as
+/// a distinct dropped uid) inside it, and the nftables redirect. The whole design
+/// was spike-validated before this code existed (see the netns-spike memory).
+#[cfg(target_os = "linux")]
+mod forced {
+    use super::*;
+
+    /// The proxy runs as the userns root (inner uid 0) so it can read its own
+    /// mitmproxy install under the user's mode-0750 $HOME; the observed server is
+    /// dropped to a DISTINCT uid so the nftables `skuid` exclusion can let the
+    /// proxy's own upstream out without redirecting the server. A sandboxed server
+    /// cannot regain uid 0 inside the userns, so it can never escape the redirect.
+    const LAUNCHER_UID: u32 = 0;
+    const SERVER_UID: u32 = 1;
+
+    /// A live rootless userns+netns with userspace egress. Both guards kill their
+    /// process (and thus tear the namespace / egress down) on Drop.
+    pub struct ForcedNet {
+        _holder: KillOnDrop,
+        _pasta: KillOnDrop,
+        nspid: String,
+    }
+
+    impl ForcedNet {
+        pub fn setup() -> Result<ForcedNet> {
+            // Hold a multi-uid userns + fresh netns open. No --fork, so unshare
+            // execs `sleep` and the spawned pid lives IN the namespaces. --map-auto
+            // maps our subuid range (via newuidmap) so a second uid exists.
+            let mut holder_child = Command::new("unshare")
+                .args([
+                    "--user",
+                    "--map-root-user",
+                    "--map-auto",
+                    "--net",
+                    "sleep",
+                    "2147483647",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .context(
+                    "spawning the userns holder (`unshare --user --map-auto --net`); \
+                     is `uidmap` installed and are unprivileged user namespaces allowed?",
+                )?;
+            let nspid = holder_child.id().to_string();
+            let holder_tail = drain_stderr_tail(holder_child.stderr.take());
+            let holder = KillOnDrop::direct(holder_child);
+
+            // Wait for the uid map to be written (newuidmap runs before sleep execs).
+            let uidmap = format!("/proc/{nspid}/uid_map");
+            wait_for_nonempty(Path::new(&uidmap), Duration::from_secs(5)).with_context(|| {
+                format!(
+                    "the userns holder did not initialize.{}",
+                    stderr_diag(&holder_tail)
+                )
+            })?;
+
+            // pasta gives the netns real upstream egress. -f keeps it in the
+            // foreground so this Child owns it and Drop reaps it (rather than a
+            // detached daemon we could not track). -4 makes the netns IPv4-only:
+            // the transparent-redirect target for a v6 flow is [::1]:port, which
+            // does not carry the original destination reliably, so a v6-preferring
+            // client (e.g. Python, which does not fall back cleanly) is lost. With
+            // no v6 route the client falls back to v4 instantly (ENETUNREACH) and
+            // is captured. Coverage limit: a v6-ONLY destination is not seen -
+            // documented in docs/THREAT-MODEL.md. slirp4netns is v4-only anyway.
+            let pasta_bin = if on_path("pasta") {
+                "pasta"
+            } else {
+                "slirp4netns"
+            };
+            let mut pasta_args: Vec<&str> = vec!["-f", "-q"];
+            if pasta_bin == "pasta" {
+                pasta_args.push("-4");
+            }
+            pasta_args.extend(["--config-net", &nspid]);
+            let mut pasta_child = Command::new(pasta_bin)
+                .args(&pasta_args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .with_context(|| format!("spawning {pasta_bin} for netns egress"))?;
+            let pasta_tail = drain_stderr_tail(pasta_child.stderr.take());
+            let pasta = KillOnDrop::direct(pasta_child);
+
+            let net = ForcedNet {
+                _holder: holder,
+                _pasta: pasta,
+                nspid,
+            };
+            // Confirm egress is actually configured before proceeding, so a broken
+            // pasta is a clear error, not a silent zero-host capture. The pasta
+            // guard now lives inside `net`; its stderr tail (an independent handle)
+            // diagnoses a failure to come up.
+            net.wait_for_egress(Duration::from_secs(8), &pasta_tail)?;
+            Ok(net)
+        }
+
+        /// Prefix that runs `argv` as the launcher uid (userns root) inside the
+        /// netns: `nsenter --user --net --preserve-credentials -t <pid> -- argv`.
+        pub fn wrap_launcher(&self, argv: &[String]) -> Vec<String> {
+            let mut v = self.nsenter_prefix();
+            v.extend(argv.iter().cloned());
+            v
+        }
+
+        /// Prefix that runs `argv` inside the netns dropped to the DISTINCT server
+        /// uid, so its sockets carry a different `skuid` than the proxy.
+        pub fn wrap_server(&self, argv: &[String]) -> Vec<String> {
+            let mut v = self.nsenter_prefix();
+            v.extend([
+                "setpriv".into(),
+                "--reuid".into(),
+                SERVER_UID.to_string(),
+                "--regid".into(),
+                SERVER_UID.to_string(),
+                "--clear-groups".into(),
+            ]);
+            v.extend(argv.iter().cloned());
+            v
+        }
+
+        fn nsenter_prefix(&self) -> Vec<String> {
+            vec![
+                "nsenter".into(),
+                "--user".into(),
+                "--net".into(),
+                "--preserve-credentials".into(),
+                "-t".into(),
+                self.nspid.clone(),
+                "--".into(),
+            ]
+        }
+
+        /// Install the redirect ruleset inside the netns (piped to `nft -f -`).
+        pub fn install_nft(&self, mitm_port: u16) -> Result<()> {
+            let ruleset = sandbox::nft_ruleset(LAUNCHER_UID, mitm_port);
+            let mut argv = self.nsenter_prefix();
+            argv.extend(["nft".into(), "-f".into(), "-".into()]);
+            let mut child = Command::new(&argv[0])
+                .args(&argv[1..])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .context("spawning nft to install the redirect")?;
+            child
+                .stdin
+                .take()
+                .context("nft stdin unavailable")?
+                .write_all(ruleset.as_bytes())
+                .context("feeding the ruleset to nft")?;
+            let out = child.wait_with_output().context("waiting for nft")?;
+            if !out.status.success() {
+                bail!(
+                    "nft rejected the forced-capture ruleset ({}): {}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+            }
+            Ok(())
+        }
+
+        /// Poll until the netns has a default route (pasta finished configuring it).
+        fn wait_for_egress(
+            &self,
+            timeout: Duration,
+            pasta_tail: &Mutex<std::collections::VecDeque<String>>,
+        ) -> Result<()> {
+            let deadline = Instant::now() + timeout;
+            let mut argv = self.nsenter_prefix();
+            argv.extend([
+                "ip".into(),
+                "-4".into(),
+                "route".into(),
+                "show".into(),
+                "default".into(),
+            ]);
+            while Instant::now() < deadline {
+                if let Ok(out) = Command::new(&argv[0]).args(&argv[1..]).output() {
+                    if out.status.success() && !out.stdout.is_empty() {
+                        return Ok(());
+                    }
+                }
+                thread::sleep(Duration::from_millis(150));
+            }
+            bail!(
+                "netns egress (pasta) did not come up - no default route after {timeout:?}.{}",
+                stderr_diag(pasta_tail)
+            )
+        }
+    }
+
+    /// Per-trial filesystem for a forced capture: a gurgl-owned base dir (so gurgl
+    /// alone cleans it up) that is world-traversable, containing a world-writable
+    /// `home` the dropped server uid can populate and a world-readable public CA
+    /// copy it can trust. The confdir CA itself lives under ~/.gurgl (0700), which
+    /// the server uid cannot reach - hence the copy. The unpredictable name is the
+    /// defense against a local pre-creation/symlink race on the shared base dir.
+    pub struct ForcedPaths {
+        base: PathBuf,
+        home: PathBuf,
+    }
+
+    impl ForcedPaths {
+        pub fn new(server: &str, trial: u32) -> Result<ForcedPaths> {
+            use std::os::unix::fs::PermissionsExt;
+            let base = std::env::temp_dir().join(format!(
+                "gurgl-forced-{}-{}-{}-{}",
+                sanitize(server),
+                std::process::id(),
+                trial,
+                rand_token()
+            ));
+            std::fs::create_dir(&base)
+                .with_context(|| format!("creating forced base {}", base.display()))?;
+            // 0755: gurgl owns it; the server uid (an "other") only needs to
+            // traverse (o+x) to reach the home and the CA.
+            std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755))?;
+            let home = base.join("home");
+            std::fs::create_dir(&home)?;
+            // 0777: the server runs as a DISTINCT uid ("other" to gurgl) and must
+            // create its package cache here; gurgl (owner) reads it back for pkgver
+            // and removes it. Exposure is bounded by the unpredictable base name.
+            std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o777))?;
+            Ok(ForcedPaths { base, home })
+        }
+
+        pub fn home(&self) -> &Path {
+            &self.home
+        }
+
+        /// Copy the confdir CA cert (public) to a world-readable path the dropped
+        /// server uid can read, returning that path.
+        pub fn install_ca(&self, ca_src: &Path) -> Result<PathBuf> {
+            use std::os::unix::fs::PermissionsExt;
+            let dst = self.base.join("ca.pem");
+            std::fs::copy(ca_src, &dst)
+                .with_context(|| format!("copying CA {} -> {}", ca_src.display(), dst.display()))?;
+            std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o644))?;
+            Ok(dst)
+        }
+    }
+
+    impl Drop for ForcedPaths {
+        fn drop(&mut self) {
+            // gurgl owns `base` (and `home` is non-sticky), so it can remove the
+            // whole tree even though the server uid wrote files inside `home`.
+            let _ = std::fs::remove_dir_all(&self.base);
+        }
+    }
+
+    /// Wait until a proc file exists and is non-empty (the uid map is written just
+    /// before the holder execs `sleep`).
+    fn wait_for_nonempty(path: &Path, timeout: Duration) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if let Ok(s) = std::fs::read_to_string(path) {
+                if !s.trim().is_empty() {
+                    return Ok(());
+                }
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        bail!("{} was not populated after {timeout:?}", path.display())
+    }
+}
+
 /// Full capture of one server@version. `mode` selects the progress UI (a live
 /// dashboard, or plain lines for pipes/scripts).
 pub fn capture(
@@ -238,10 +585,17 @@ pub fn capture(
     plan: &FlightPlan,
     mode: report::Mode,
     monitor: Monitor,
+    forced: bool,
 ) -> Result<Snapshot> {
     // Preflight before taking over the terminal, so a missing-backend error
     // prints normally rather than inside the dashboard's alternate screen.
     preflight(cfg)?;
+    // Forced capture has its own toolchain (netns egress + nftables + uidmap) and
+    // only runs on Linux+bubblewrap. Check it up front, with the exact fix, so an
+    // opt-in that can't run here fails clearly instead of silently degrading.
+    if forced {
+        preflight_forced(cfg)?;
+    }
     // The server's own launch command is a runtime of the *target*, not of gurgl
     // (Node for `npx`, Python for `python3`/`uvx`, ...). Check it up front so a
     // missing one is a clear message, not a silent zero-host capture.
@@ -289,7 +643,7 @@ pub fn capture(
             break;
         }
         reporter.trial_start(i, trial_count);
-        let trial = run_trial(cfg, spec, plan, i, monitor, reporter.as_mut())
+        let trial = run_trial(cfg, spec, plan, i, monitor, forced, reporter.as_mut())
             .with_context(|| format!("trial {i} of {}", spec.name))?;
         if reported_version.is_none() {
             reported_version = trial.server_version;
@@ -370,10 +724,14 @@ pub fn capture(
         trials: completed_trials,
         flightplan: plan.fingerprint(),
         gurgl_version: env!("CARGO_PKG_VERSION").to_string(),
-        // env-proxy is the only implemented capture strategy today; the forced
-        // backend (netns + transparent redirect) will stamp Forced here once it
-        // lands. Stamp what was actually run, never what was requested.
-        capture_mode: CaptureMode::EnvProxy,
+        // Stamp what was actually RUN, never what was requested: `forced` only
+        // reaches here after preflight_forced passed and every trial launched
+        // through the netns. An env-proxy fallback must never be labeled Forced.
+        capture_mode: if forced {
+            CaptureMode::Forced
+        } else {
+            CaptureMode::EnvProxy
+        },
         reported_version: reported_display,
         version_source: Some(version_source.as_str().to_string()),
         hosts,
@@ -749,12 +1107,26 @@ fn is_capture_reserved(name: &str) -> bool {
 /// A sleep step is a short idle window; long observation is `watch --for`.
 const MAX_SLEEP_SECS: u64 = 24 * 60 * 60;
 
+/// The env-proxy sandbox HOME: a 0700 dir inside the trial scratch (same uid as
+/// gurgl), holding the launcher's resolved install for pkgver to read post-teardown.
+fn mk_scratch_home(tmp: &Path) -> Result<PathBuf> {
+    let h = tmp.join("home");
+    std::fs::create_dir(&h).with_context(|| format!("creating sandbox home {}", h.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&h, std::fs::Permissions::from_mode(0o700));
+    }
+    Ok(h)
+}
+
 fn run_trial(
     cfg: &Config,
     spec: &ServerSpec,
     plan: &FlightPlan,
     trial: u32,
     monitor: Monitor,
+    forced: bool,
     reporter: &mut dyn Reporter,
 ) -> Result<Trial> {
     // Per-trial scratch (its own flow file + addon copy). ScratchDir creates it
@@ -766,18 +1138,46 @@ fn run_trial(
     let addon_path = tmp.join("mitm_flows.py");
     std::fs::write(&addon_path, proxy::FLOWS_ADDON).context("writing mitm addon")?;
 
-    // The sandbox HOME is a host-side dir (inside this trial's scratch, so it is
-    // 0700 and removed on Drop with everything else). Binding it as HOME lets the
-    // package manager's resolved install land on host-readable disk that survives
-    // teardown, so pkgver can read the real installed version below.
-    let home_dir = tmp.join("home");
-    std::fs::create_dir(&home_dir)
-        .with_context(|| format!("creating sandbox home {}", home_dir.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&home_dir, std::fs::Permissions::from_mode(0o700));
-    }
+    // Forced capture builds a private network namespace with userspace egress and
+    // an nftables redirect, so even a proxy-ignoring or cert-pinning client is
+    // captured (see the `forced` module). Its teardown guards must live for the
+    // whole trial. None = ordinary env-proxy capture (the child must honor the
+    // proxy env). The setup is Linux-only; preflight_forced already gated this.
+    #[cfg(target_os = "linux")]
+    let forced_net = match forced {
+        true => Some(
+            forced::ForcedNet::setup()
+                .context("bringing up the forced-capture network namespace")?,
+        ),
+        false => None,
+    };
+    #[cfg(not(target_os = "linux"))]
+    let forced_net: Option<()> = {
+        let _ = forced;
+        None
+    };
+
+    // The sandbox HOME is a host-side dir binding the launcher's resolved install,
+    // so pkgver can read the real version after teardown. In env-proxy mode it is
+    // a 0700 dir inside the scratch (same uid as gurgl). In forced mode the server
+    // runs as a DISTINCT unprivileged uid (so nftables can tell it from the
+    // proxy) and cannot write a gurgl-owned 0700 dir, so `ForcedPaths` provides a
+    // world-writable, unpredictably-named home plus the public CA it needs.
+    #[cfg(target_os = "linux")]
+    let forced_paths = match &forced_net {
+        Some(_) => Some(forced::ForcedPaths::new(&spec.name, trial)?),
+        None => None,
+    };
+    let home_dir = {
+        #[cfg(target_os = "linux")]
+        if let Some(fp) = &forced_paths {
+            fp.home().to_path_buf()
+        } else {
+            mk_scratch_home(tmp)?
+        }
+        #[cfg(not(target_os = "linux"))]
+        mk_scratch_home(tmp)?
+    };
 
     // Stable, isolated mitmproxy conf dir so the CA persists across runs.
     let confdir = mitm_confdir()?;
@@ -786,6 +1186,24 @@ fn run_trial(
 
     // --- start the proxy ---
     let port = free_port()?;
+    #[cfg(target_os = "linux")]
+    let proxy_argv = match &forced_net {
+        // env-proxy: a regular listening proxy on host loopback.
+        None => proxy::build_argv(
+            &cfg.mitmdump,
+            &addon_path.to_string_lossy(),
+            &confdir.to_string_lossy(),
+            port,
+        ),
+        // forced: a TRANSPARENT proxy INSIDE the netns, run as the launcher uid.
+        Some(fnet) => fnet.wrap_launcher(&proxy::build_transparent_argv(
+            &cfg.mitmdump,
+            &addon_path.to_string_lossy(),
+            &confdir.to_string_lossy(),
+            port,
+        )),
+    };
+    #[cfg(not(target_os = "linux"))]
     let proxy_argv = proxy::build_argv(
         &cfg.mitmdump,
         &addon_path.to_string_lossy(),
@@ -807,16 +1225,53 @@ fn run_trial(
     let proxy_stderr_tail = drain_stderr_tail(proxy_child.stderr.take());
     let mut proxy_guard = KillOnDrop::direct(proxy_child);
 
-    wait_for_port(port, Duration::from_secs(20))
-        .with_context(|| proxy_start_failure(&proxy_stderr_tail))?;
-    wait_for_file(&ca_path, Duration::from_secs(15))
-        .context("mitmproxy CA cert was not generated")?;
+    // Readiness. env-proxy: mitmdump listens on host loopback, so wait_for_port
+    // sees it. Forced: it listens INSIDE the netns (invisible to the host), so the
+    // CA file appearing is the boot signal; install the nft redirect only AFTER
+    // it is up, or early client traffic would be redirected to a dead port.
+    #[cfg(target_os = "linux")]
+    match &forced_net {
+        None => {
+            wait_for_port(port, Duration::from_secs(20))
+                .with_context(|| proxy_start_failure(&proxy_stderr_tail))?;
+            wait_for_file(&ca_path, Duration::from_secs(15))
+                .context("mitmproxy CA cert was not generated")?;
+        }
+        Some(fnet) => {
+            wait_for_file(&ca_path, Duration::from_secs(20))
+                .with_context(|| proxy_start_failure(&proxy_stderr_tail))?;
+            thread::sleep(Duration::from_millis(400));
+            check_proxy_alive(&mut proxy_guard.child, "startup", &proxy_stderr_tail)?;
+            fnet.install_nft(port)
+                .context("installing the forced-capture nftables redirect")?;
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        wait_for_port(port, Duration::from_secs(20))
+            .with_context(|| proxy_start_failure(&proxy_stderr_tail))?;
+        wait_for_file(&ca_path, Duration::from_secs(15))
+            .context("mitmproxy CA cert was not generated")?;
+    }
+
+    // Forced mode hands the server the PUBLIC CA via a world-readable copy: the
+    // confdir cert lives under ~/.gurgl (0700), which the unprivileged server uid
+    // cannot traverse. env-proxy runs the server as gurgl's own uid, so it reads
+    // the confdir cert directly.
+    #[cfg(target_os = "linux")]
+    let ca_for_server = match &forced_paths {
+        Some(fp) => fp.install_ca(&ca_path)?,
+        None => ca_path.clone(),
+    };
+    #[cfg(not(target_os = "linux"))]
+    let ca_for_server = ca_path.clone();
 
     // --- launch the sandboxed server, wired to the proxy ---
     let penv = sandbox::ProxyEnv {
         https_proxy: format!("http://127.0.0.1:{port}"),
-        ca_cert_path: ca_path.to_string_lossy().to_string(),
+        ca_cert_path: ca_for_server.to_string_lossy().to_string(),
         sandbox_home: home_dir.to_string_lossy().to_string(),
+        forced,
     };
     // Forward only the env vars this server explicitly opted into (pass_env),
     // read from gurgl's own environment. The sandbox is otherwise env-cleared so
@@ -843,7 +1298,16 @@ fn run_trial(
             extra_env.push((k.clone(), v));
         }
     }
-    let argv = sandbox::build_argv(cfg.sandbox, spec, Some(&penv), &extra_env);
+    let base_argv = sandbox::build_argv(cfg.sandbox, spec, Some(&penv), &extra_env);
+    // Forced mode runs the whole sandbox INSIDE the netns and drops it to the
+    // distinct server uid (nsenter + setpriv); env-proxy runs it directly.
+    #[cfg(target_os = "linux")]
+    let argv = match &forced_net {
+        Some(fnet) => fnet.wrap_server(&base_argv),
+        None => base_argv,
+    };
+    #[cfg(not(target_os = "linux"))]
+    let argv = base_argv;
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..]);
     // bwrap (--clearenv) and podman (-e only) isolate the child's environment via

@@ -118,9 +118,36 @@ Two verified gotchas worth stating plainly:
   server run under `/usr/bin/python3` fails the TLS handshake to the proxy and
   captures zero hosts. Use a Python that honors the CA env (python.org / certifi).
 
-A client that opens raw sockets or pins its certificate also escapes capture.
-The tracked hardening step (network namespace + transparent redirect) forces
-*routing* for everyone, but trust still requires the CA. Report coverage gaps
+A client that opens raw sockets or pins its certificate also escapes **env-proxy**
+capture. That is the whole reason for the opt-in **forced** mode.
+
+### Forced capture (`gurgl watch --forced` / `capture = "forced"`)
+
+Forced mode stops *trusting* the client to route through the proxy and *forces*
+routing at the network layer. It runs the sandbox inside a rootless network
+namespace (unprivileged `unshare` + `pasta` userspace egress) and installs an
+nftables rule that transparently REDIRECTs all TCP 80/443 to the proxy and drops
+UDP/443 (QUIC/HTTP-3). So a client that ignores `HTTPS_PROXY` and opens raw
+sockets is still captured - the routing is not its choice. The proxy runs as one
+uid and the server as a distinct, unprivileged uid so the rule can let the proxy's
+own upstream out without looping (and, as a bonus, the server cannot read your
+home directory). Linux + bubblewrap only; needs `pasta`, `nftables`, and `uidmap`
+(`gurgl doctor` checks this).
+
+Two honest limits remain even in forced mode:
+
+- **Hostnames, and cert-pinning still breaks the connection.** The proxy reads the
+  destination from the TLS SNI (recorded before cert validation via a ClientHello
+  hook), so a cert-pinning client that ignores the proxy *cannot hide the hostname
+  it dials* - but because forced mode still intercepts TLS, that client's own
+  handshake fails against the lab cert, so its connection breaks. gurgl saw the
+  host (the point of an inventory tool); the server may not function. A future
+  non-decrypting passthrough could read SNI without breaking TLS.
+- **IPv4 only.** The transparent redirect is reliable for IPv4; the netns is made
+  IPv4-only so clients fall back to v4 and are captured. A destination reachable
+  *only* over IPv6 is therefore not seen under forced capture.
+
+In both modes, trust still requires the CA for decryption. Report coverage gaps
 honestly rather than reading silence as safety.
 
 ## The one-line summary to keep in your head

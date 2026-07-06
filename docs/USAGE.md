@@ -250,6 +250,24 @@ you intend to diff. `--until-closed` catches Ctrl-C to stop cleanly, save what i
 saw, and restore the terminal (on Unix). `--for` and `--until-closed` are mutually
 exclusive.
 
+**Forcing capture (`--forced`).** By default gurgl relies on the server honoring
+proxy env vars (env-proxy capture); a client that opens raw sockets or pins certs
+escapes it. `gurgl watch --forced` closes that gap: it routes *all* of the
+server's TCP egress through the proxy with a network namespace + transparent
+nftables redirect, so a proxy-ignoring client is captured too. The snapshot is
+stamped `capture_mode = forced`. It is **Linux + bubblewrap only** and needs
+`pasta`, `nftables`, and `uidmap` on the machine (`gurgl doctor` checks and prints
+the exact install command); it captures IPv4 and runs the server as an
+unprivileged uid that cannot read your home, so its runtime must be on a system
+path (`/usr`), not only under `$HOME` (nvm/`~/.local`). `--forced` overrides the
+`capture` setting in gurgl.toml for one run. See docs/THREAT-MODEL.md for the two
+honest limits (IPv4-only; a cert-pinning client's own connection breaks even
+though gurgl still records the host).
+
+```console
+$ gurgl watch my-server --forced
+```
+
 ### `gurgl plan`
 
 `gurgl plan <server>` scaffolds a **draft flight plan** from what a server
@@ -471,10 +489,17 @@ it never gates). `gurgl export` always writes JSON, so `--json` does not apply t
 it.
 
 Every snapshot also records its **capture mode** - how egress was forced through
-the proxy. Today that is always `env-proxy` (only clients that honor proxy env
-vars are captured; a client that opens raw sockets or pins certs escapes it); a
-future `forced` mode will route *all* TCP egress through the proxy. It is a
-statement about the capture *mechanism*, never a safety or completeness claim.
+the proxy. The default is `env-proxy` (only clients that honor proxy env vars are
+captured; a client that opens raw sockets or pins certs escapes it). The opt-in
+`forced` mode (`gurgl watch --forced`, or `capture = "forced"` in gurgl.toml)
+routes *all* of the server's TCP egress through the proxy with a network namespace
++ transparent redirect, so a proxy-ignoring client is captured too. Forced mode is
+Linux + bubblewrap only and needs `pasta`, `nftables`, and `uidmap` (run `gurgl
+doctor` to check); it captures IPv4 and runs the server as an unprivileged uid
+that cannot read your home, so its runtime must be on a system path, and a
+cert-pinning client's own connection breaks even though gurgl still records the
+host it dialed (see docs/THREAT-MODEL.md). The mode is a statement about the
+capture *mechanism*, never a safety or completeness claim.
 `show` prints it in the header, `gurgl.show/1` carries it inside `snapshot`, and
 `gurgl.diff/1` adds `from_capture_mode` / `to_capture_mode` /
 `capture_mode_mismatch` (additive fields - the schema tag stays `/1`). A
@@ -530,6 +555,12 @@ flightplan = "flightplans/default.toml"
 # Trials per capture. More trials = a stronger reproduction gate (less
 # server-side cohort/feature-gate noise leaking through as "drift").
 trials = 5
+
+# Capture strategy. "env-proxy" (default) trusts the server to honor proxy env
+# vars. "forced" routes ALL of its TCP egress through the proxy via a network
+# namespace + transparent redirect (Linux + bubblewrap only; needs pasta,
+# nftables, uidmap - see `gurgl doctor`). `watch --forced` overrides this per run.
+# capture = "env-proxy"
 
 # --- the servers you watch ------------------------------------------------
 [[servers]]

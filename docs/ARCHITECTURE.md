@@ -57,16 +57,22 @@ v1 uses **env-proxy capture**: the sandboxed child gets `HTTPS_PROXY` +
 honor these, so their real egress is captured.
 
 The gap: a client that *ignores* proxy env vars, or that opens raw sockets,
-escapes capture. Closing it is the tracked hardening step - run the child in its
-own network namespace where the only reachable route is a transparent redirect
-(nftables `REDIRECT`/`TPROXY`) to the proxy, and block UDP/443 to force
-HTTP/2-over-TCP (so QUIC/HTTP-3 can't bypass). Until then, capture is honest for
-cooperating clients and marked incomplete for others.
+escapes env-proxy capture. The opt-in **forced** mode (Linux, `watch --forced` /
+`capture = "forced"`) closes it: it runs the sandbox in a rootless network
+namespace (`unshare` + `pasta` userspace egress) whose only route to 80/443 is a
+transparent nftables `REDIRECT` to the proxy, and it drops UDP/443 so QUIC/HTTP-3
+falls back to interceptable TCP. The proxy runs as the userns root and the server
+as a distinct unprivileged uid, so an `nft ... meta skuid <proxy> return` rule
+lets the proxy's own upstream out without looping (and the server can't read your
+home). It captures IPv4; a cert-pinning client's host is still recorded (via the
+TLS SNI) even though its own handshake against the lab cert fails. Env-proxy stays
+the default and the only option off Linux. See `sandbox::nft_ruleset`,
+`proxy::build_transparent_argv`, and `observe::forced`, and docs/THREAT-MODEL.md.
 
-Each snapshot records a `capture_mode` (`env-proxy` today, `forced` once the netns
-path lands) so `show`/`diff`/`doctor` state which mechanism was used, and a
-cross-mode `diff` warns rather than reading a stronger mode's newly-seen host as
-drift. It is a mechanism label, never a completeness claim.
+Each snapshot records a `capture_mode` (`env-proxy` or `forced`) so
+`show`/`diff`/`doctor` state which mechanism was used, and a cross-mode `diff`
+warns rather than reading a stronger mode's newly-seen host as drift. It is a
+mechanism label, never a completeness claim.
 
 ## The reproduction gate
 

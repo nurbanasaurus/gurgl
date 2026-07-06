@@ -143,6 +143,7 @@ fn run() -> Result<i32> {
             until_closed,
             diff,
             allow_overwrite,
+            forced,
         }) => cmd_watch(
             &cfg,
             &store,
@@ -153,6 +154,7 @@ fn run() -> Result<i32> {
             *until_closed,
             *diff,
             *allow_overwrite,
+            *forced,
         ),
         Some(Commands::Discover { import }) => {
             cmd_discover(*import, cli.json, &import_target(&cli)).map(|_| 0)
@@ -1079,7 +1081,13 @@ fn cmd_watch(
     until_closed: bool,
     audit: bool,
     allow_overwrite: bool,
+    forced_flag: bool,
 ) -> Result<i32> {
+    // Forced capture is opt-in: the `--forced` flag OR `capture = "forced"` in
+    // gurgl.toml. The flag wins for this run. observe::capture re-checks
+    // feasibility (preflight_forced) and errors clearly if it can't run here, so a
+    // request never silently degrades to env-proxy under a Forced label.
+    let forced = forced_flag || matches!(cfg.capture, model::CaptureMode::Forced);
     // A named server watches just that one; bare `gurgl watch` (like `--all`)
     // watches every server configured in gurgl.toml.
     let targets: Vec<&config::ServerSpec> = match server {
@@ -1155,7 +1163,7 @@ fn cmd_watch(
             compare_to.as_ref().map(|v| store.load(&spec.name, v));
         match FlightPlan::load(&plan_path)
             .with_context(|| format!("loading flight plan {}", plan_path.display()))
-            .and_then(|plan| observe::capture(cfg, spec, &plan, mode, monitor))
+            .and_then(|plan| observe::capture(cfg, spec, &plan, mode, monitor, forced))
             .and_then(|snap| {
                 let overwrote = store.exists(&snap.server, &snap.version);
                 // Rug-pull guard: refuse to silently overwrite a stored
@@ -1502,20 +1510,22 @@ fn cmd_doctor(cfg: &Config, store: &Store, cfg_path: Option<&Path>) -> Result<i3
         );
     }
     println!(
-        "  [info]    capture mode: env-proxy (the only mode implemented today) - relies on servers\n\
-         \x20           honoring proxy env vars; a client that opens raw sockets or pins certs\n\
-         \x20           escapes it (docs/THREAT-MODEL.md). Quiet is never proof."
+        "  [info]    capture mode: env-proxy (the default) - relies on servers honoring proxy env\n\
+         \x20           vars; a client that opens raw sockets or pins certs escapes it\n\
+         \x20           (docs/THREAT-MODEL.md). Quiet is never proof. `--forced` closes that gap."
     );
-    // Preview whether the forthcoming forced backend (netns + transparent
-    // redirect, which would close the raw-socket gap) could run on THIS machine.
-    // It is not implemented yet, so say so - never imply a capability we lack.
+    // Whether the forced backend (netns + transparent redirect, which closes the
+    // raw-socket / cert-pinning gap) can run on THIS machine. It is opt-in
+    // (`gurgl watch --forced` or `capture = "forced"`), never the silent default.
     match forced_capture_feasible() {
         Ok(()) => println!(
-            "  [info]    forced capture (netns + transparent redirect) is not implemented yet; this\n\
-             \x20           machine looks capable of running it once it ships."
+            "  [info]    forced capture (netns + transparent redirect) is available here: opt in with\n\
+             \x20           `gurgl watch --forced` or `capture = \"forced\"` in gurgl.toml. It forces ALL\n\
+             \x20           of the server's TCP egress through the proxy (IPv4; a v6-only host is not\n\
+             \x20           seen), running it as an unprivileged uid that cannot read your home."
         ),
         Err(reason) => println!(
-            "  [info]    forced capture (not implemented yet) would be unavailable here regardless:\n\
+            "  [info]    forced capture (opt-in: `--forced`) is unavailable here:\n\
              \x20           {reason}."
         ),
     }
@@ -1563,6 +1573,23 @@ fn forced_capture_feasible() -> Result<(), String> {
              --unshare-net namespace has no upstream route without one"
                 .to_string(),
         );
+    }
+    // `newuidmap` (from `uidmap`) maps the SECOND uid the redirect exclusion needs:
+    // the proxy runs as one uid and the server as another so nftables can let the
+    // proxy's own upstream out without looping. A single-uid userns cannot do this.
+    if !observe::on_path("newuidmap") {
+        return Err(
+            "`newuidmap` is missing (install the `uidmap` package) - forced capture maps a \
+             second uid so nftables can tell the proxy from the server"
+                .to_string(),
+        );
+    }
+    for bin in ["unshare", "nsenter", "setpriv"] {
+        if !observe::on_path(bin) {
+            return Err(format!(
+                "`{bin}` is missing (install `util-linux`) - forced capture enters the netns with it"
+            ));
+        }
     }
     // Ubuntu 23.10+ can forbid unprivileged user namespaces via AppArmor; the
     // forced path needs one to own a netns it can add nft rules to without root.

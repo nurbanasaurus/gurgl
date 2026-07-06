@@ -9,23 +9,35 @@
 # We record the HOST and TIME ONLY, never request/response bodies. gurgl is an
 # egress *inventory* tool, not a payload interceptor - see docs/THREAT-MODEL.md.
 #
-# Two hooks, deliberately:
+# Three hooks, deliberately, so the destination host survives both proxy modes
+# (env-proxy CONNECT and forced-transparent redirect) AND a failed interception:
 #
-#  - request() records flow.request.host - the authority mitmproxy actually dials
-#    upstream (the CONNECT target / absolute-form request URL host). NOT
-#    pretty_host: pretty_host prefers the HTTP Host header, which the observed
-#    server fully controls and can spoof, and mitmproxy's own docs warn it "may
-#    be manipulated by malicious actors". The single field the whole inventory,
-#    diff, and allowlist are built from must be the real destination, not an
-#    attacker-chosen string.
+#  - request() records the dialed authority. Prefer the TLS SNI
+#    (flow.client_conn.sni) and fall back to flow.request.host. In env-proxy mode
+#    request.host is the CONNECT target and the SNI equals it, so this is
+#    unchanged. In forced/transparent mode request.host is the ORIGINAL-DEST IP
+#    (there is no CONNECT), so the SNI is the only hostname - and it is the name
+#    the client put on the wire to route the connection, NOT the HTTP Host header.
+#    We still never use pretty_host / host_header: those prefer the Host header,
+#    which the observed server fully controls and mitmproxy's own docs warn "may
+#    be manipulated by malicious actors". The inventory must key on the real
+#    destination, not an attacker-chosen string.
 #
-#  - http_connect() records the CONNECT target too, before TLS. Its host is known
-#    even when interception then FAILS (the client pins its cert or does not
-#    trust the lab CA - the macOS system-python case gurgl's doctor warns about),
-#    so a contacted host is never silently dropped: the coverage gap is recorded,
-#    not hidden (THREAT-MODEL.md: mark gaps, never report silence as safety).
-#    request() also fires when interception succeeds; gurgl dedups (host, phase),
-#    so the duplicate collapses.
+#  - http_connect() records the CONNECT target before TLS (env-proxy mode). Its
+#    host is known even when interception then FAILS (a cert-pinning client, or
+#    one that does not trust the lab CA - the macOS system-python case doctor
+#    warns about), so a contacted host is never silently dropped.
+#
+#  - tls_clienthello() records the SNI before TLS completes - the transparent
+#    analog of http_connect. In forced/transparent mode there is no CONNECT, so
+#    without this a cert-pinning client that ignores the proxy would leave no
+#    record at all; the ClientHello SNI is visible on the wire regardless of
+#    whether the client then accepts the lab cert, so the hostname is captured
+#    even when the raw-socket, cert-pinning client defeats decryption. Recorded
+#    as an observed contact (connect=True). request() also fires when
+#    interception succeeds; gurgl dedups (host, phase), so duplicates collapse.
+#
+# HOST + TIME ONLY, never bodies (THREAT-MODEL.md).
 
 import json
 import os
@@ -41,8 +53,8 @@ class FlowLogger:
             return
         rec = {"host": host, "time": time.time()}
         if connect:
-            # Seen at CONNECT; TLS interception may not have succeeded. Recorded
-            # so the host is not lost; gurgl treats it as an observed contact.
+            # Seen before/without successful interception. Recorded so the host
+            # is not lost; gurgl treats it as an observed contact.
             rec["connect"] = True
         try:
             with open(self.path, "a", encoding="utf-8") as fh:
@@ -58,9 +70,21 @@ class FlowLogger:
             return
         self._record(host, connect=True)
 
+    def tls_clienthello(self, data):
+        # The SNI is the server name the client dialed, visible before cert
+        # validation, so a forced-mode client that pins certs cannot hide the
+        # host it contacted. Not the (attacker-controllable) Host header.
+        try:
+            sni = data.client_hello.sni
+        except Exception:
+            return
+        self._record(sni, connect=True)
+
     def request(self, flow):
         try:
-            host = flow.request.host
+            # SNI first (the real transport destination in transparent mode),
+            # else the dialed request host. Never the Host header.
+            host = flow.client_conn.sni or flow.request.host
         except Exception:
             return
         self._record(host, connect=False)

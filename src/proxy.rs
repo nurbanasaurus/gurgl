@@ -36,6 +36,35 @@ pub fn build_argv(mitmdump: &str, addon_path: &str, confdir: &str, port: u16) ->
     ]
 }
 
+/// Build the argv for the FORCED-capture proxy: mitmdump in transparent mode.
+///
+/// Unlike the env-proxy `build_argv`, this expects traffic arriving via an
+/// nftables REDIRECT (the client never speaks the proxy protocol), so it runs
+/// `--mode transparent` and does NOT pin `--listen-host` to loopback - the
+/// redirect rewrites the destination, and mitmdump reads the original via
+/// `SO_ORIGINAL_DST`. The addon records the TLS SNI (see mitm_flows.py), so
+/// `--showhost` (which would trust the Host header) is deliberately omitted.
+/// Runs inside the capture network namespace; the caller wraps it with `nsenter`.
+pub fn build_transparent_argv(
+    mitmdump: &str,
+    addon_path: &str,
+    confdir: &str,
+    port: u16,
+) -> Vec<String> {
+    vec![
+        mitmdump.to_string(),
+        "-q".into(),
+        "--mode".into(),
+        "transparent".into(),
+        "--listen-port".into(),
+        port.to_string(),
+        "--set".into(),
+        format!("confdir={confdir}"),
+        "-s".into(),
+        addon_path.to_string(),
+    ]
+}
+
 /// One request observed by the proxy: destination host + wall-clock time.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RawFlow {
@@ -130,6 +159,25 @@ mod tests {
             .windows(2)
             .any(|w| w[0] == "-s" && w[1] == "/tmp/addon.py"));
         assert!(argv.iter().any(|a| a == "confdir=/tmp/conf"));
+    }
+
+    #[test]
+    fn transparent_argv_uses_transparent_mode_and_addon() {
+        let argv = build_transparent_argv("mitmdump", "/tmp/addon.py", "/tmp/conf", 9090);
+        assert_eq!(argv[0], "mitmdump");
+        assert!(argv
+            .windows(2)
+            .any(|w| w[0] == "--mode" && w[1] == "transparent"));
+        assert!(argv
+            .windows(2)
+            .any(|w| w[0] == "--listen-port" && w[1] == "9090"));
+        assert!(argv
+            .windows(2)
+            .any(|w| w[0] == "-s" && w[1] == "/tmp/addon.py"));
+        assert!(argv.iter().any(|a| a == "confdir=/tmp/conf"));
+        // A transparent proxy must NOT be pinned to a regular-proxy listen host,
+        // and --showhost (which trusts the Host header) must stay off.
+        assert!(!argv.iter().any(|a| a == "--showhost"));
     }
 
     #[test]

@@ -32,6 +32,12 @@ pub struct ProxyEnv {
     /// teardown so gurgl can read the version the launcher resolved into it (see
     /// `pkgver`); the caller removes it after. Empty string = no home binding.
     pub sandbox_home: String,
+    /// Forced-capture launch (netns + transparent redirect): the client is
+    /// REDIRECTED to the proxy by nftables, never proxied, so the proxy env vars
+    /// are omitted (a transparent mitmdump cannot accept a CONNECT and would
+    /// break a cooperating client that tried to use them). Only the CA-trust vars
+    /// remain, so the intercepting cert is accepted. `false` = env-proxy capture.
+    pub forced: bool,
 }
 
 /// PATH for a sandboxed child: prepend gurgl's and the user-local bin dirs to the
@@ -61,39 +67,71 @@ pub fn base_env() -> Vec<(String, String)> {
 impl ProxyEnv {
     /// (KEY, VALUE) pairs to set in the sandboxed process environment.
     pub fn vars(&self) -> Vec<(String, String)> {
-        let path = base_path();
-        vec![
-            ("PATH".into(), path),
-            // Route TLS through the proxy. Both cases: clients differ on which
-            // they read (curl/Python honor either; Node reads both under the
-            // NODE_USE_ENV_PROXY flag below).
-            ("HTTPS_PROXY".into(), self.https_proxy.clone()),
-            ("HTTP_PROXY".into(), self.https_proxy.clone()),
-            ("ALL_PROXY".into(), self.https_proxy.clone()),
-            ("https_proxy".into(), self.https_proxy.clone()),
-            ("http_proxy".into(), self.https_proxy.clone()),
-            ("all_proxy".into(), self.https_proxy.clone()),
+        // The CA-trust vars are needed in BOTH modes so the intercepting cert is
+        // accepted. GURGL_FLOWOUT is deliberately NOT set here: only the mitmproxy
+        // addon reads it, and it runs OUTSIDE the sandbox (gurgl sets it on the
+        // mitmdump process directly). Injecting it would advertise the evidence
+        // file path and fingerprint the run as "under gurgl".
+        let mut v = vec![
+            ("PATH".into(), base_path()),
             // Explicitly empty NO_PROXY so an inherited value (or one a client
-            // sets by default) cannot carve out hosts that then egress
-            // unobserved. Empty = no bypass exceptions; capture everything.
+            // sets by default) cannot carve out hosts that egress unobserved.
             ("NO_PROXY".into(), String::new()),
             ("no_proxy".into(), String::new()),
-            // Node ignores proxy env vars by default. This (Node 24+) makes its
-            // core http/https client AND fetch honor them; harmless on older Node.
-            // Verified: without it, node egress bypasses the proxy entirely.
-            ("NODE_USE_ENV_PROXY".into(), "1".into()),
-            // CA trust so the intercepting cert is accepted:
             ("NODE_EXTRA_CA_CERTS".into(), self.ca_cert_path.clone()),
             ("SSL_CERT_FILE".into(), self.ca_cert_path.clone()),
             ("REQUESTS_CA_BUNDLE".into(), self.ca_cert_path.clone()),
             ("CURL_CA_BUNDLE".into(), self.ca_cert_path.clone()),
-            // NOTE: GURGL_FLOWOUT is deliberately NOT set here. Only the
-            // mitmproxy addon reads it, and it runs OUTSIDE the sandbox (gurgl
-            // sets it on the mitmdump process directly). Injecting it into the
-            // observed server served no purpose and advertised the exact path of
-            // the evidence file, plus a "you are under gurgl" fingerprint.
-        ]
+        ];
+        // Forced mode redirects the client to the proxy with nftables, so it must
+        // NOT advertise a proxy: a transparent mitmdump cannot answer a CONNECT,
+        // and a cooperating client that honored HTTPS_PROXY would then fail. The
+        // redirect captures the raw connection regardless; env-proxy mode instead
+        // relies on the client honoring these vars.
+        if !self.forced {
+            for k in [
+                "HTTPS_PROXY",
+                "HTTP_PROXY",
+                "ALL_PROXY",
+                "https_proxy",
+                "http_proxy",
+                "all_proxy",
+            ] {
+                v.push((k.into(), self.https_proxy.clone()));
+            }
+            // Node ignores proxy env by default; this (Node 24+) makes its
+            // http/https client AND fetch honor it. Pointless without a proxy, so
+            // forced mode omits it (there, the redirect does the forcing).
+            v.push(("NODE_USE_ENV_PROXY".into(), "1".into()));
+        }
+        v
     }
+}
+
+/// The nftables ruleset that FORCES a proxy-ignoring client's TCP egress through
+/// the transparent proxy, inside the capture network namespace. Pure so it is
+/// unit-testable; the caller feeds it to `nft -f -` via `nsenter`.
+///
+/// It is an `inet` table (an `ip` table would let IPv6 escape) hooking `output`
+/// (the traffic is locally generated inside the netns, not forwarded). The
+/// `skuid <launcher_uid> return` line is load-bearing: the proxy runs as that uid
+/// and its OWN upstream connection to the origin must NOT be re-redirected, or it
+/// loops into itself (a flow storm). Everything else on 80/443 is redirected to
+/// the proxy; UDP/443 is dropped so a client cannot slip out over QUIC/HTTP-3.
+/// Validated by the slice-1b spike (see the netns-spike memory).
+pub fn nft_ruleset(launcher_uid: u32, mitm_port: u16) -> String {
+    format!(
+        "table inet gurgl {{\n  \
+           chain out {{\n    \
+             type nat hook output priority -100; policy accept;\n    \
+             meta skuid {launcher_uid} return\n    \
+             tcp dport {mitm_port} return\n    \
+             ip daddr 127.0.0.0/8 return\n    \
+             tcp dport {{ 80, 443 }} redirect to :{mitm_port}\n    \
+             udp dport 443 drop\n  \
+           }}\n\
+         }}\n"
+    )
 }
 
 /// Build the argv to launch `spec` under the chosen sandbox backend.
@@ -205,13 +243,17 @@ fn build_bwrap_argv(
         argv.push("--ro-bind".into());
         argv.push(e.ca_cert_path.clone());
         argv.push(e.ca_cert_path.clone());
-    } else {
-        // A no-proxy launch (gurgl plan) resolves DNS ITSELF to reach the registry
-        // (the capture path routes DNS through the proxy instead, so its sandbox
-        // deliberately can't - which also avoids DNS leaking around the proxy).
-        // /etc/resolv.conf is often a symlink into /run (systemd-resolved) that the
-        // /etc bind alone leaves dangling, so bind the resolved target at its own
-        // path to satisfy it. -try tolerates a plain-file resolv.conf or none.
+    }
+    // Bind the RESOLVED /etc/resolv.conf whenever the sandbox must resolve DNS
+    // ITSELF: a no-proxy authoring launch (`gurgl plan`, env=None) and a FORCED
+    // capture (the client is redirected, not proxied, so there is no CONNECT for
+    // the proxy to resolve on its behalf). env-proxy capture deliberately skips
+    // this - DNS goes through the proxy there, so the sandbox needs no resolver
+    // (which also stops DNS leaking around the proxy). /etc/resolv.conf is usually
+    // a symlink into /run (systemd-resolved) that the /etc bind leaves dangling,
+    // so bind the canonical target at its own path. -try tolerates a plain file.
+    let needs_own_dns = env.is_none() || env.map(|e| e.forced).unwrap_or(false);
+    if needs_own_dns {
         if let Ok(real) = std::fs::canonicalize("/etc/resolv.conf") {
             let p = real.to_string_lossy().to_string();
             argv.push("--ro-bind-try".into());
@@ -241,7 +283,14 @@ fn build_bwrap_argv(
     // node) rather than in /usr, and would otherwise not exist inside the
     // sandbox. Read-only; -try tolerates absence. (The sandbox is not a security
     // boundary yet; see the module docs and docs/THREAT-MODEL.md.)
-    if let Some(home) = dirs::home_dir() {
+    //
+    // Skipped in forced mode: the server there runs as a DISTINCT, unprivileged
+    // uid that cannot traverse a mode-0750 $HOME, so these binds would fail on
+    // EACCES (not the ENOENT that -try tolerates). Forced captures therefore need
+    // the server's runtime on a system path (/usr, /opt). This is also a security
+    // gain - the untrusted server cannot read the user's home at all.
+    let forced = env.map(|e| e.forced).unwrap_or(false);
+    if let (false, Some(home)) = (forced, dirs::home_dir()) {
         // Bind ONLY ~/.gurgl/bin, not all of ~/.gurgl: the parent also holds the
         // mitmproxy CA PRIVATE key, every prior snapshot (the egress inventory of
         // every server captured), and the review sidecars - none of which the
@@ -371,6 +420,7 @@ mod tests {
             https_proxy: "http://127.0.0.1:8080".into(),
             ca_cert_path: "/tmp/gurgl-ca.pem".into(),
             sandbox_home: "/tmp/gurgl-home-xyz".into(),
+            forced: false,
         }
     }
 
@@ -500,6 +550,56 @@ mod tests {
             !argv.iter().any(|a| a.contains("flows")),
             "flow log must not be mounted into the container"
         );
+    }
+
+    #[test]
+    fn bwrap_forced_skips_home_runtime_binds() {
+        // In forced mode the server runs as a distinct unprivileged uid that
+        // cannot traverse a mode-0750 $HOME, so the ~/.local/~/.nvm/... binds are
+        // omitted (they would hard-fail on EACCES); env-proxy keeps them.
+        let mut e = env();
+        e.forced = true;
+        let forced = build_argv(SandboxKind::Bubblewrap, &spec(), Some(&e), &[]);
+        let plain = build_argv(SandboxKind::Bubblewrap, &spec(), Some(&env()), &[]);
+        let mentions_local = |argv: &[String]| argv.iter().any(|a| a.ends_with("/.local"));
+        assert!(mentions_local(&plain), "env-proxy binds ~/.local");
+        assert!(!mentions_local(&forced), "forced must not bind ~/.local");
+        // The CA is still bound in both (the server must trust the intercept cert).
+        assert!(forced.iter().any(|a| a == "/tmp/gurgl-ca.pem"));
+    }
+
+    #[test]
+    fn forced_env_drops_proxy_vars_but_keeps_ca_trust() {
+        // Forced/transparent capture redirects the client instead of proxying it,
+        // so advertising HTTPS_PROXY would break a cooperating client (a
+        // transparent mitmdump cannot answer a CONNECT). The CA-trust vars must
+        // stay so the intercepting cert is accepted.
+        let mut e = env();
+        e.forced = true;
+        let vars = e.vars();
+        let has = |k: &str| vars.iter().any(|(n, _)| n == k);
+        assert!(!has("HTTPS_PROXY") && !has("https_proxy") && !has("ALL_PROXY"));
+        assert!(!has("NODE_USE_ENV_PROXY"));
+        assert!(has("NODE_EXTRA_CA_CERTS") && has("SSL_CERT_FILE") && has("CURL_CA_BUNDLE"));
+        assert!(has("PATH") && has("NO_PROXY"));
+        // env-proxy mode still advertises the proxy.
+        assert!(env().vars().iter().any(|(n, _)| n == "HTTPS_PROXY"));
+    }
+
+    #[test]
+    fn nft_ruleset_excludes_launcher_uid_and_forces_tcp() {
+        let rs = nft_ruleset(0, 8080);
+        // inet table (not ip - IPv6 would escape an ip table), output hook.
+        assert!(rs.contains("table inet gurgl"));
+        assert!(rs.contains("hook output"));
+        // The load-bearing loop-breaker: the proxy's own uid is excluded, BEFORE
+        // the redirect line (order matters - a return after redirect never runs).
+        let excl = rs.find("skuid 0 return").expect("excludes launcher uid");
+        let redir = rs.find("redirect to :8080").expect("redirects to the port");
+        assert!(excl < redir, "the uid exclusion must precede the redirect");
+        assert!(rs.contains("tcp dport { 80, 443 }"));
+        // QUIC/HTTP-3 bypass is closed.
+        assert!(rs.contains("udp dport 443 drop"));
     }
 
     #[test]

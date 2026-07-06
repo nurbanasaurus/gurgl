@@ -157,6 +157,13 @@ pub enum Commands {
         /// after reviewing the delta (`gurgl diff <server>`).
         #[arg(long = "allow-overwrite")]
         allow_overwrite: bool,
+        /// Force ALL of the server's TCP egress through the proxy using a network
+        /// namespace + transparent redirect, instead of trusting it to honor proxy
+        /// env vars. Closes the raw-socket / cert-pinning bypass. Linux + bubblewrap
+        /// only; needs pasta, nftables, and uidmap (see `gurgl doctor`). Overrides
+        /// `capture` in gurgl.toml for this run.
+        #[arg(long = "forced")]
+        forced: bool,
     },
 
     /// Find MCP servers configured on this machine (Claude, Cursor, Windsurf, ...).

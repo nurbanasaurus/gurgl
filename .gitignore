@@ -5,3 +5,5 @@
 flows.jsonl         # raw mitmdump capture scratch
 /scratch
 .DS_Store
+__pycache__/        # mitmproxy compiles the bundled addon (assets/mitm_flows.py)
+*.pyc

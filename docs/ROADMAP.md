@@ -46,9 +46,21 @@ the plan of record.
 
 ### 1. Forced-capture backend: netns + transparent redirect (the unanimous #1)
 
-**Status: slice 1a (capture_mode labeling) shipped.** The `capture_mode` field,
-doctor readiness probe, and show/diff labeling are done and hardcoded to
-`env-proxy`; slice 1b (the forced backend) remains, spike-gated as below.
+**Status: SHIPPED (both slices, Linux) and live-verified.** Slice 1a
+(capture_mode labeling) plus slice 1b (the forced backend) are done. The design
+was spike-validated on the Pop!_OS box before any gurgl code was written (rootless
+multi-uid userns + pasta egress + `nft inet` OUTPUT REDIRECT with the launcher-uid
+exclusion + transparent mitmdump; bwrap-in-netns preserves the uid distinction;
+the SNI is captured even when a cert-pinning client rejects the lab CA). The
+load-bearing test passed live: a proxy-ignoring MCP server (`urllib` with
+`ProxyHandler({})`) is captured (`example.com`, stable) under `--forced` and
+observed 0 hosts under env-proxy. What actually shipped vs. the plan below: the
+opt-in is a `capture = "forced"` config key + `watch --forced` flag (not a new
+`SandboxKind`); the netns is made IPv4-only because the v6 REDIRECT target
+(`[::1]:port`) does not carry the original destination reliably (documented
+coverage limit); `uidmap`/`newuidmap` is required (the second uid the exclusion
+needs); the addon gained a `tls_clienthello` SNI hook. macOS Seatbelt hardening
+is still open. The rest of this item is kept as the original design record.
 
 **Goal.** An additive Linux capture strategy that forces *all* child TCP egress
 through mitmdump - not just clients that honor `HTTPS_PROXY` - blocks UDP/443 so

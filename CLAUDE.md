@@ -114,7 +114,16 @@ Path helpers live in `config.rs` (`gurgl_home()`, `default_config_path()`,
   version a human reviewed; `diff --baseline`/`watch --diff` compare against it).
 - `sandbox.rs` / `proxy.rs` - `build_argv()` (pure, tested) + spawn helpers.
   `ProxyEnv.sandbox_home` is a host-side dir bound as the sandbox HOME so the
-  launcher's resolved install survives teardown for `pkgver`.
+  launcher's resolved install survives teardown for `pkgver`. `ProxyEnv.forced`
+  selects forced capture: `vars()` then omits the proxy env (a transparent
+  mitmdump can't answer a CONNECT) and keeps only CA trust, and the bwrap argv
+  skips the home-runtime binds (the dropped server uid can't traverse $HOME) and
+  binds the resolved `/etc/resolv.conf` (forced clients resolve DNS themselves).
+  `sandbox::nft_ruleset(launcher_uid, port)` is the pure REDIRECT ruleset;
+  `proxy::build_transparent_argv` is mitmdump's transparent-mode argv. The
+  forced-capture process orchestration lives in `observe::forced` (ForcedNet =
+  the userns holder + pasta; ForcedPaths = the world-writable server home + public
+  CA copy the dropped uid needs).
 - `pkgver.rs` - pure, bounded, no-network derivation of the version a launcher
   (npx/uvx/pipx/bunx) actually installed: `package_from_args` (argv -> package)
   and `installed_version` (read `package.json`/`*.dist-info` under the sandbox
@@ -178,8 +187,24 @@ The live capture (`observe::run_trial`) works. Remaining:
   HOME is now a host-side bind (not a tmpfs `--dir`) so the resolved package
   survives teardown to be read. A layout gurgl doesn't recognize degrades to
   `None` and falls back to server-reported/`unknown` - never errors a capture.
-- **Capture hardening** - force all egress through the proxy (network namespace
-  + transparent redirect on Linux; a real least-privilege Seatbelt profile on
-  macOS) instead of relying on the client honoring `HTTPS_PROXY`. The sandbox is
-  functional but explicitly not a boundary yet (docs/THREAT-MODEL.md).
-- **Capture fidelity notes** - per-target flags for known proxy-fingerprinting.
+- **Capture hardening (Linux)** - DONE for Linux. Opt-in `forced` capture
+  (`gurgl watch --forced` or `capture = "forced"`) routes ALL of the server's TCP
+  egress through the proxy instead of trusting `HTTPS_PROXY`: a rootless
+  userns+netns (`unshare --map-auto`, so `uidmap`/`newuidmap` is required),
+  `pasta` userspace egress (forced IPv4 - the v6 REDIRECT target is unreliable),
+  and an nftables `inet` OUTPUT REDIRECT of TCP 80/443 to a TRANSPARENT mitmdump,
+  dropping UDP/443. The proxy runs as the userns root (reads its own install under
+  the mode-0750 $HOME) and the server is dropped to a distinct uid so
+  `nft ... meta skuid <launcher> return` breaks the proxy's self-loop; the server
+  therefore also can't read your home, so forced captures need the runtime on a
+  system path. `sandbox::nft_ruleset` (pure) + `proxy::build_transparent_argv`
+  (pure) + `observe::forced` (the ForcedNet/ForcedPaths orchestration) +
+  `preflight_forced`. `capture_mode` is stamped `Forced` only after it actually
+  ran. The whole design was spike-validated before coding (the load-bearing test:
+  a `--noproxy '*'` client is captured under forced, invisible under env-proxy).
+  The mitm addon now records the TLS SNI (via a `tls_clienthello` hook, so a
+  cert-pinning client can't hide the hostname) with `request.host` fallback.
+  macOS Seatbelt hardening is still a TODO (a real least-privilege profile).
+- **Capture fidelity notes** - per-target flags for known proxy-fingerprinting;
+  a non-decrypting TLS-passthrough forced mode (read SNI without breaking a
+  cert-pinning client's connection); IPv6 forced capture.

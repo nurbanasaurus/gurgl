@@ -136,6 +136,7 @@ fn run() -> Result<i32> {
             duration,
             until_closed,
             diff,
+            allow_overwrite,
         }) => cmd_watch(
             &cfg,
             &store,
@@ -145,6 +146,7 @@ fn run() -> Result<i32> {
             duration.as_deref(),
             *until_closed,
             *diff,
+            *allow_overwrite,
         ),
         Some(Commands::Discover { import }) => {
             cmd_discover(*import, cli.json, &import_target(&cli)).map(|_| 0)
@@ -1006,6 +1008,7 @@ fn cmd_watch(
     duration: Option<&str>,
     until_closed: bool,
     audit: bool,
+    allow_overwrite: bool,
 ) -> Result<i32> {
     // A named server watches just that one; bare `gurgl watch` (like `--all`)
     // watches every server configured in gurgl.toml.
@@ -1053,6 +1056,7 @@ fn cmd_watch(
     // flight plan is per-server: a server's own `flightplan` wins over the default.
     let multi = targets.len() > 1;
     let mut captured = 0usize;
+    let mut refused = 0usize;
     let mut skipped: Vec<String> = Vec::new();
     // --diff: per-server drift lines, printed after the batch summary.
     let mut drift_lines: Vec<String> = Vec::new();
@@ -1084,10 +1088,33 @@ fn cmd_watch(
             .and_then(|plan| observe::capture(cfg, spec, &plan, mode, monitor))
             .and_then(|snap| {
                 let overwrote = store.exists(&snap.server, &snap.version);
+                // Rug-pull guard: refuse to silently overwrite a stored
+                // same-version capture whose STABLE host set changed - that is
+                // what a re-released package looks like. Keep the prior file and
+                // report it as drift. A first capture, a no-change re-capture, or
+                // an intermittent-only change never trips this (same_label_conflict
+                // requires trials>=2 both sides, same fingerprint, stable-set delta).
+                if overwrote && !allow_overwrite {
+                    if let Ok(prev) = store.load(&snap.server, &snap.version) {
+                        if let Some(conflict) = diff::same_label_conflict(&prev, &snap) {
+                            return Ok((None, snap, overwrote, Some(conflict)));
+                        }
+                    }
+                }
                 let path = store.save(&snap)?;
-                Ok((path, snap, overwrote))
+                Ok((Some(path), snap, overwrote, None))
             }) {
-            Ok((path, snap, overwrote)) => {
+            Ok((path, snap, overwrote, conflict)) => {
+                // A refused overwrite: show the stable delta, keep the stored
+                // capture, count it as drift (exit 1), move to the next server.
+                if let Some(conflict) = conflict {
+                    print_stable_conflict(&snap, &conflict);
+                    refused += 1;
+                    drifted = true;
+                    continue;
+                }
+                // Not refused: the save happened, so a path is present.
+                let Some(path) = path else { continue };
                 println!(
                     "saved {}@{} -> {}",
                     snap.server,
@@ -1202,12 +1229,15 @@ fn cmd_watch(
 
     if multi {
         print!("\n{captured} captured");
+        if refused > 0 {
+            print!(", {refused} refused (same-version stable-set change)");
+        }
         if !skipped.is_empty() {
             print!(", {} skipped: {}", skipped.len(), skipped.join(", "));
         }
         println!();
     }
-    if captured == 0 {
+    if captured == 0 && refused == 0 {
         // A deliberate quit before anything completed is not an error.
         if observe::stop_requested() {
             println!("stopped by user; nothing captured");
@@ -1230,7 +1260,44 @@ fn cmd_watch(
         }
         println!("\nno drift needing scrutiny - exit 0.");
     }
+    // A refused same-version overwrite is drift under an unchanged version label,
+    // so exit 1 (the same meaning `watch --diff` gives) even without --diff, so
+    // automation notices the rug-pull signal. The prior capture was kept intact.
+    if refused > 0 {
+        println!(
+            "\n{refused} capture(s) refused to overwrite a same-version snapshot whose stable \
+             host set changed (the prior capture was kept) - exit 1. Review with `gurgl diff \
+             <server>`, then re-run with --allow-overwrite to replace, or pin a distinct version."
+        );
+        return Ok(1);
+    }
     Ok(0)
+}
+
+/// Print the stable-host delta behind a refused same-version overwrite. Neutral
+/// wording (constraint #1): the stored capture's stable host set changed under an
+/// unchanged version label, which is what a re-released package looks like - not
+/// a verdict, an observation the user must review.
+fn print_stable_conflict(snap: &model::Snapshot, conflict: &diff::StableConflict) {
+    println!(
+        "refused to overwrite {}@{}: its stable host set changed under the same version label \
+         (a re-released package looks exactly like this). Kept the stored capture.",
+        snap.server, snap.version
+    );
+    if let Some(src) = &snap.version_source {
+        println!("  version source: {src}");
+    }
+    for h in &conflict.added {
+        println!("    + {h}   (stable, now present; was not in the stored capture)");
+    }
+    for h in &conflict.removed {
+        println!("    - {h}   (stable, no longer seen; was in the stored capture)");
+    }
+    println!(
+        "  to proceed: `gurgl diff {}` to inspect, then re-run with `--allow-overwrite` to \
+         replace, or pin a distinct version in gurgl.toml.",
+        snap.server
+    );
 }
 
 /// `gurgl doctor`: readiness + capture-fidelity report for THIS machine.

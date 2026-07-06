@@ -194,8 +194,21 @@ capturing filesystem-mcp (5 trials)...
 saved filesystem-mcp@1.3.0 -> /home/you/.gurgl/snapshots/filesystem-mcp/1.3.0.json
 ```
 
-Each capture writes `<store>/<server>/<version>.json`. Re-running the same
-version overwrites it.
+Each capture writes `<store>/<server>/<version>.json`. The `<version>` is the one
+the launcher (npx/uvx/pipx) actually **installed**, read from the package's own
+files inside the sandbox - not the server's self-reported `serverInfo.version`,
+which is attacker-chosen (a package can claim `0.2.0` while installing as
+`2026.7.4`). The self-reported value is kept as `reported_version` and any
+discrepancy is surfaced; `version_source` records where the label came from
+(`config` > `installed-package` > `server-reported` > `unknown`).
+
+Re-running the same version normally overwrites it. But if the stored capture's
+**stable host set changed** under the same version label - exactly what a
+re-released ("rug-pulled") package looks like - `watch` **refuses** to overwrite,
+prints the stable-host delta, keeps the prior capture, and exits `1`. Review with
+`gurgl diff <server>`, then re-run with `--allow-overwrite` to replace it, or pin
+a distinct `version` in gurgl.toml for a diffable history. (A first capture, a
+no-change re-capture, or an intermittent-only change never triggers the refusal.)
 
 The output above is the **plain** form, used when stderr is not a terminal (piped
 to a file, in CI) or with `--plain`. In a terminal, `watch` instead shows a live
@@ -410,7 +423,9 @@ automation too.
 **`gurgl watch --all --diff`** is the one-shot audit: capture every server, diff
 each against its accepted baseline (else its previous version), print a
 per-server drift summary, and exit 1 if anything needs scrutiny. Made for cron -
-see [RECIPES.md](RECIPES.md).
+see [RECIPES.md](RECIPES.md). Note that `watch` also exits 1 (even without
+`--diff`) when it **refuses a same-version overwrite** whose stable host set
+changed; the prior capture is kept. Both are the same "needs review" signal.
 
 **`--json`** switches `list`, `show`, `diff`, and `discover` to stable,
 versioned JSON on stdout (`gurgl.diff/1` etc.). The epistemic caveat travels in

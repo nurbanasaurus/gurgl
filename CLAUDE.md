@@ -90,7 +90,11 @@ Path helpers live in `config.rs` (`gurgl_home()`, `default_config_path()`,
   "no egress observed" from a dead process would be a false observation.
   `config::SCRATCH_DIR` is guaranteed at capture time (host-side + bwrap
   `--dir`) so the starter config works out of the box.
-- `diff.rs` - pure `diff(from, to) -> SnapshotDiff`.
+- `diff.rs` - pure `diff(from, to) -> SnapshotDiff`, plus `same_label_conflict`
+  (the rug-pull guard: `Some` only when a same-version overwrite's STABLE host set
+  changed, both sides ran a battery, same flight-plan fingerprint). `watch`
+  refuses such an overwrite unless `--allow-overwrite`, keeps the prior capture,
+  and exits 1.
 - `emit.rs` - `allowlist(snapshot, Format)` for sandbox-runtime / opensnitch / squid.
 - `share.rs` - `gurgl export` (scrub a snapshot into a shareable "shared capture":
   stable hosts only, `class` dropped, time coarsened to a date, publishing

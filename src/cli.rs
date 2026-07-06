@@ -134,6 +134,13 @@ pub enum Commands {
         /// showed new stable hosts needing scrutiny - the one-shot cron audit.
         #[arg(long = "diff")]
         diff: bool,
+        /// Overwrite a stored same-version snapshot even when its stable host set
+        /// changed. By default gurgl REFUSES that (exit 1) and keeps the prior
+        /// capture: a same-version capture whose stable hosts changed is exactly
+        /// what a re-released ("rug-pulled") package looks like. Pass this only
+        /// after reviewing the delta (`gurgl diff <server>`).
+        #[arg(long = "allow-overwrite")]
+        allow_overwrite: bool,
     },
 
     /// Find MCP servers configured on this machine (Claude, Cursor, Windsurf, ...).

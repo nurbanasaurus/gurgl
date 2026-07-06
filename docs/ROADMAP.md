@@ -46,6 +46,10 @@ the plan of record.
 
 ### 1. Forced-capture backend: netns + transparent redirect (the unanimous #1)
 
+**Status: slice 1a (capture_mode labeling) shipped.** The `capture_mode` field,
+doctor readiness probe, and show/diff labeling are done and hardcoded to
+`env-proxy`; slice 1b (the forced backend) remains, spike-gated as below.
+
 **Goal.** An additive Linux capture strategy that forces *all* child TCP egress
 through mitmdump - not just clients that honor `HTTPS_PROXY` - blocks UDP/443 so
 QUIC clients fall back to interceptable TCP, and stamps every `Snapshot` with how
@@ -121,6 +125,11 @@ or server-side exfil, and the fidelity docs restate that.
 independently so the labeling value survives even if the netns spike stalls.
 
 ### 2. Version from the installed package + rug-pull guard - L
+
+**Status: shipped.** Both halves are done and live-verified - derivation from the
+installed package (`pkgver`, sandbox HOME now a host bind) and the rug-pull guard
+(`diff::same_label_conflict`; `watch` refuses a stable-set-changing same-version
+overwrite, exit 1, `--allow-overwrite` to bypass).
 
 **Goal.** Label a capture with the version the package manager *actually resolved
 and installed* inside the sandbox (read from local files only - `package.json`

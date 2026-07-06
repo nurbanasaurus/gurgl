@@ -23,7 +23,7 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::model::{classify, Host, HostClass, Reproducibility, Snapshot};
+use crate::model::{classify, CaptureMode, Host, HostClass, Reproducibility, Snapshot};
 use crate::proxy::{normalize_host, strip_control};
 
 pub const SHARE_SCHEMA: &str = "gurgl.shared-capture/1";
@@ -285,6 +285,10 @@ fn shared_to_snapshot(sc: SharedCapture) -> Snapshot {
         trials: sc.trials,
         flightplan: sc.flightplan,
         gurgl_version: sc.gurgl_version,
+        // A shared capture asserts no capture mode (the export format does not
+        // carry one), so default to the honest floor - never claim `forced` for
+        // someone else's untrusted file.
+        capture_mode: CaptureMode::EnvProxy,
         hosts: sc
             .hosts
             .into_iter()
@@ -332,6 +336,10 @@ fn sanitize_and_regate(snap: Snapshot, first_party: &[String]) -> Snapshot {
         trials: snap.trials,
         flightplan: strip_control(&snap.flightplan),
         gurgl_version: strip_control(&snap.gurgl_version),
+        // Carry the mode through untouched: it is gurgl's own method provenance,
+        // not a third-party characterization (unlike `class`, which is dropped).
+        // For a shared-capture source it is already the EnvProxy floor.
+        capture_mode: snap.capture_mode,
         hosts,
     }
 }
@@ -374,6 +382,7 @@ mod tests {
             trials: 2,
             flightplan: "default-abc".to_string(),
             gurgl_version: "0.1.0".to_string(),
+            capture_mode: CaptureMode::EnvProxy,
             hosts,
         }
     }
@@ -429,6 +438,7 @@ mod tests {
             trials: 2,
             flightplan: "fp".to_string(),
             gurgl_version: "x".to_string(),
+            capture_mode: CaptureMode::EnvProxy,
             hosts: vec![
                 host("registry.npmjs.org", Reproducibility::Stable),
                 host("flaky.example", Reproducibility::Intermittent),

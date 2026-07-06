@@ -421,6 +421,19 @@ hosts. `diff --against` emits `gurgl.diff-against/1` (carrying
 it never gates). `gurgl export` always writes JSON, so `--json` does not apply to
 it.
 
+Every snapshot also records its **capture mode** - how egress was forced through
+the proxy. Today that is always `env-proxy` (only clients that honor proxy env
+vars are captured; a client that opens raw sockets or pins certs escapes it); a
+future `forced` mode will route *all* TCP egress through the proxy. It is a
+statement about the capture *mechanism*, never a safety or completeness claim.
+`show` prints it in the header, `gurgl.show/1` carries it inside `snapshot`, and
+`gurgl.diff/1` adds `from_capture_mode` / `to_capture_mode` /
+`capture_mode_mismatch` (additive fields - the schema tag stays `/1`). A
+`capture_mode_mismatch` means the two captures used different mechanisms, so a
+"new" host may just be one the weaker mode missed rather than new egress; `diff`
+flags it in text like a flight-plan mismatch. `gurgl doctor` reports which mode is
+achievable on the machine and why.
+
 ```sh
 gurgl --json diff my-server | jq -r '.needs_scrutiny[]'
 ```

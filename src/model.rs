@@ -74,6 +74,41 @@ pub enum Reproducibility {
     Observed,
 }
 
+/// How a capture forced the child's traffic through the proxy. This is a
+/// statement about the capture *mechanism*, never a completeness or safety claim.
+///
+/// `Forced` routes *all* of the child's TCP egress through the proxy (network
+/// namespace + transparent redirect), closing the gap where a client that
+/// ignores proxy env vars or opens raw sockets escapes capture. `EnvProxy` - the
+/// default and, for now, the only implemented mode - only wires proxy env vars,
+/// so a client that does not honor them can look quiet while talking. Neither
+/// mode sees inside a trusted channel or anything server-side
+/// (docs/THREAT-MODEL.md): `Forced` is a stronger mechanism, not "complete",
+/// "safe", or "verified".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum CaptureMode {
+    /// The child was wired with proxy env vars; only clients that honor the proxy
+    /// are captured. The honest floor for any capture whose mechanism is unknown
+    /// (e.g. an old snapshot predating this field), so it is the default - an
+    /// unlabeled capture must never be read as `Forced`.
+    #[default]
+    EnvProxy,
+    /// All of the child's TCP egress was routed through the proxy regardless of
+    /// whether it honored proxy env vars. Still presence-only.
+    Forced,
+}
+
+impl std::fmt::Display for CaptureMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // pad() so a format width applies when this is printed directly.
+        f.pad(match self {
+            CaptureMode::EnvProxy => "env-proxy",
+            CaptureMode::Forced => "forced",
+        })
+    }
+}
+
 /// One observed egress destination for a server@version, aggregated over trials.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Host {
@@ -100,6 +135,12 @@ pub struct Snapshot {
     pub flightplan: String,
     /// Version of gurgl that produced this snapshot.
     pub gurgl_version: String,
+    /// How the capture forced egress through the proxy (`env-proxy` or `forced`).
+    /// `#[serde(default)]` so snapshots captured before this field existed load as
+    /// `env-proxy`, never `forced` - defaulting an unlabeled capture to `forced`
+    /// would be a false coverage claim.
+    #[serde(default)]
+    pub capture_mode: CaptureMode,
     pub hosts: Vec<Host>,
 }
 
@@ -240,6 +281,23 @@ mod tests {
         assert_eq!(
             classify("telemetry.myvendor.com", &fp),
             HostClass::FirstParty
+        );
+    }
+
+    #[test]
+    fn capture_mode_defaults_to_env_proxy_and_renders_kebab() {
+        // The default is the honest floor: an unlabeled capture is never `forced`.
+        assert_eq!(CaptureMode::default(), CaptureMode::EnvProxy);
+        assert_eq!(CaptureMode::EnvProxy.to_string(), "env-proxy");
+        assert_eq!(CaptureMode::Forced.to_string(), "forced");
+        // Serde tag is kebab-case (the wire form other tools will read).
+        assert_eq!(
+            serde_json::to_string(&CaptureMode::Forced).unwrap(),
+            "\"forced\""
+        );
+        assert_eq!(
+            serde_json::from_str::<CaptureMode>("\"env-proxy\"").unwrap(),
+            CaptureMode::EnvProxy
         );
     }
 }

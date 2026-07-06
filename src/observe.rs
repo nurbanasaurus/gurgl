@@ -19,7 +19,7 @@ use serde_json::Value;
 
 use crate::config::{Config, ServerSpec};
 use crate::flightplan::FlightPlan;
-use crate::model::{classify, Host, HostClass, Reproducibility, Snapshot};
+use crate::model::{classify, CaptureMode, Host, HostClass, Reproducibility, Snapshot};
 use crate::proxy::{FlowHost, RawFlow};
 use crate::report::{self, Reporter};
 use crate::{mcp, proxy, sandbox};
@@ -339,6 +339,10 @@ pub fn capture(
         trials: completed_trials,
         flightplan: plan.fingerprint(),
         gurgl_version: env!("CARGO_PKG_VERSION").to_string(),
+        // env-proxy is the only implemented capture strategy today; the forced
+        // backend (netns + transparent redirect) will stamp Forced here once it
+        // lands. Stamp what was actually run, never what was requested.
+        capture_mode: CaptureMode::EnvProxy,
         hosts,
     };
     reporter.finish(&snapshot);

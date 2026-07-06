@@ -29,7 +29,7 @@ use clap::Parser;
 use crate::cli::{Cli, Commands};
 use crate::config::Config;
 use crate::flightplan::FlightPlan;
-use crate::model::Reproducibility;
+use crate::model::{CaptureMode, Reproducibility};
 use crate::store::Store;
 
 /// Exit-code contract (grep convention, so scripts can gate on drift):
@@ -456,8 +456,8 @@ fn cmd_show(store: &Store, server: &str, version: Option<&str>, json: bool) -> R
         return Ok(());
     }
     println!(
-        "{}@{}  ({} trials, flight plan {})",
-        snap.server, snap.version, snap.trials, snap.flightplan
+        "{}@{}  ({} trials, flight plan {}, capture {})",
+        snap.server, snap.version, snap.trials, snap.flightplan, snap.capture_mode
     );
     println!("{:<40} {:<12} {:<12} SEEN", "HOST", "CLASS", "REPRO");
     for h in &snap.hosts {
@@ -498,8 +498,9 @@ fn cmd_show(store: &Store, server: &str, version: Option<&str>, json: bool) -> R
             );
         }
     }
+    println!("\n{}", capture_mode_note(snap.capture_mode));
     println!(
-        "\nnote: presence only - hosts observed under this flight plan. Absence of a host \
+        "note: presence only - hosts observed under this flight plan. Absence of a host \
          is non-coverage,\nnot proof the tool won't contact it."
     );
     let scrutiny = snap
@@ -533,6 +534,22 @@ fn class_legend(class: &str) -> &'static str {
         "registry" => "package registry / code host (expected for npx- or uvx-launched servers)",
         "unknown" => "matched no rule - the class to scrutinize when stable",
         _ => "",
+    }
+}
+
+/// One-line explanation of what a capture mode did and did not cover. A mechanism
+/// statement only - never "safe"/"complete"/"verified" (constraint #1/#2).
+fn capture_mode_note(mode: CaptureMode) -> &'static str {
+    match mode {
+        CaptureMode::EnvProxy => {
+            "capture mode env-proxy: only egress from clients that honor proxy env vars was seen; \
+             a client that ignores them or opens raw sockets is not captured here, so it can look \
+             quiet while talking."
+        }
+        CaptureMode::Forced => {
+            "capture mode forced: all of the child's TCP egress was routed through the proxy \
+             (still presence-only; server-side and trusted-channel activity remain invisible)."
+        }
     }
 }
 
@@ -621,6 +638,9 @@ fn cmd_diff(
             "from_flightplan": from_snap.flightplan,
             "to_flightplan": to_snap.flightplan,
             "flightplan_mismatch": from_snap.flightplan != to_snap.flightplan,
+            "from_capture_mode": from_snap.capture_mode,
+            "to_capture_mode": to_snap.capture_mode,
+            "capture_mode_mismatch": from_snap.capture_mode != to_snap.capture_mode,
             "to_trials": to_snap.trials,
             "note": "presence only: hosts observed under this flight plan. Absence is non-coverage, not proof.",
         });
@@ -636,6 +656,19 @@ fn cmd_diff(
                 "  ! flight plans differ ({} -> {}): new or missing hosts may reflect the changed \
                  method, not the tool. Re-capture both under one plan to compare cleanly.",
                 from_snap.flightplan, to_snap.flightplan
+            );
+        }
+        if from_snap.capture_mode != to_snap.capture_mode {
+            // The capture mode is also part of the method. A weaker->stronger mode
+            // change (env-proxy -> forced) can surface hosts that were always
+            // contacted but previously escaped capture; those are NOT new egress.
+            // Flag it like a flight-plan mismatch so a mode change is never misread
+            // as drift.
+            println!(
+                "  ! capture modes differ ({} -> {}): a stronger mode sees egress the weaker one \
+                 missed, so \"new\" hosts may have been contacted all along, not newly added. \
+                 Re-capture both under one mode to compare cleanly.",
+                from_snap.capture_mode, to_snap.capture_mode
             );
         }
 
@@ -1317,9 +1350,23 @@ fn cmd_doctor(cfg: &Config, store: &Store, cfg_path: Option<&Path>) -> Result<i3
         );
     }
     println!(
-        "  [info]    capture relies on servers honoring proxy env vars; a client that opens raw\n\
-         \x20           sockets or pins certs escapes it (docs/THREAT-MODEL.md). Quiet is never proof."
+        "  [info]    capture mode: env-proxy (the only mode implemented today) - relies on servers\n\
+         \x20           honoring proxy env vars; a client that opens raw sockets or pins certs\n\
+         \x20           escapes it (docs/THREAT-MODEL.md). Quiet is never proof."
     );
+    // Preview whether the forthcoming forced backend (netns + transparent
+    // redirect, which would close the raw-socket gap) could run on THIS machine.
+    // It is not implemented yet, so say so - never imply a capability we lack.
+    match forced_capture_feasible() {
+        Ok(()) => println!(
+            "  [info]    forced capture (netns + transparent redirect) is not implemented yet; this\n\
+             \x20           machine looks capable of running it once it ships."
+        ),
+        Err(reason) => println!(
+            "  [info]    forced capture (not implemented yet) would be unavailable here regardless:\n\
+             \x20           {reason}."
+        ),
+    }
 
     // --- verdictless wrap-up ------------------------------------------------------
     let next = if blockers > 0 {
@@ -1344,6 +1391,57 @@ fn probe_version(bin: &str, args: &[&str]) -> Option<String> {
     let s = String::from_utf8_lossy(&out.stdout);
     let line = s.lines().next()?.trim().to_string();
     (!line.is_empty()).then_some(line)
+}
+
+/// Could THIS machine support the forthcoming forced-capture backend (netns +
+/// transparent redirect)? Pure detection returning the first concrete blocker so
+/// `doctor` can state it plainly. The backend is not implemented yet (slice 1a
+/// ships the `capture_mode` labeling only); this is a readiness preview, and the
+/// backend slice will reuse it to decide the achievable mode.
+#[cfg(target_os = "linux")]
+fn forced_capture_feasible() -> Result<(), String> {
+    if !observe::on_path("nft") {
+        return Err(
+            "nftables `nft` is not on PATH (needed for the transparent-redirect rules)".to_string(),
+        );
+    }
+    if !observe::on_path("pasta") && !observe::on_path("slirp4netns") {
+        return Err(
+            "no rootless netns egress helper found (need `pasta` or `slirp4netns`) - a \
+             --unshare-net namespace has no upstream route without one"
+                .to_string(),
+        );
+    }
+    // Ubuntu 23.10+ can forbid unprivileged user namespaces via AppArmor; the
+    // forced path needs one to own a netns it can add nft rules to without root.
+    if read_kernel_flag("/proc/sys/kernel/apparmor_restrict_unprivileged_userns") == Some(true) {
+        return Err("unprivileged user namespaces are restricted by AppArmor \
+             (kernel.apparmor_restrict_unprivileged_userns=1)"
+            .to_string());
+    }
+    if read_kernel_flag("/proc/sys/kernel/unprivileged_userns_clone") == Some(false) {
+        return Err(
+            "unprivileged user namespaces are disabled (kernel.unprivileged_userns_clone=0)"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Non-Linux hosts cannot run the netns/nftables forced backend at all.
+#[cfg(not(target_os = "linux"))]
+fn forced_capture_feasible() -> Result<(), String> {
+    Err("forced capture is Linux-only (it uses network namespaces + nftables)".to_string())
+}
+
+/// Read a kernel 0/1 flag file; None if absent or unparseable.
+#[cfg(target_os = "linux")]
+fn read_kernel_flag(path: &str) -> Option<bool> {
+    match std::fs::read_to_string(path).ok()?.trim() {
+        "1" => Some(true),
+        "0" => Some(false),
+        _ => None,
+    }
 }
 
 /// `gurgl explain`: the latest capture (or one host) narrated in sentences.
@@ -1952,7 +2050,7 @@ fn repro_str(r: Reproducibility) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Host, HostClass, Snapshot};
+    use crate::model::{CaptureMode, Host, HostClass, Snapshot};
 
     fn snap(version: &str, hosts: Vec<Host>) -> Snapshot {
         Snapshot {
@@ -1962,6 +2060,7 @@ mod tests {
             trials: 5,
             flightplan: "fp".into(),
             gurgl_version: "0".into(),
+            capture_mode: CaptureMode::EnvProxy,
             hosts,
         }
     }
@@ -2034,5 +2133,29 @@ mod tests {
         assert_eq!(t.as_bytes()[4], b'-');
         assert_eq!(t.as_bytes()[7], b'-');
         assert!(t.starts_with("20"));
+    }
+
+    #[test]
+    fn capture_mode_note_is_mechanism_only() {
+        // Constraint #1/#2: the mode note is a statement about the capture
+        // mechanism and must never imply safety or completeness.
+        for mode in [CaptureMode::EnvProxy, CaptureMode::Forced] {
+            let note = capture_mode_note(mode);
+            assert!(!note.is_empty());
+            let lc = note.to_ascii_lowercase();
+            for forbidden in ["safe", "clean", "verified", "complete"] {
+                assert!(
+                    !lc.contains(forbidden),
+                    "capture_mode_note({mode}) must not imply '{forbidden}': {note}"
+                );
+            }
+        }
+        // Each mode names itself and the two read differently.
+        assert!(capture_mode_note(CaptureMode::EnvProxy).contains("env-proxy"));
+        assert!(capture_mode_note(CaptureMode::Forced).contains("forced"));
+        assert_ne!(
+            capture_mode_note(CaptureMode::EnvProxy),
+            capture_mode_note(CaptureMode::Forced)
+        );
     }
 }

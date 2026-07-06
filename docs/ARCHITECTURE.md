@@ -63,6 +63,11 @@ own network namespace where the only reachable route is a transparent redirect
 HTTP/2-over-TCP (so QUIC/HTTP-3 can't bypass). Until then, capture is honest for
 cooperating clients and marked incomplete for others.
 
+Each snapshot records a `capture_mode` (`env-proxy` today, `forced` once the netns
+path lands) so `show`/`diff`/`doctor` state which mechanism was used, and a
+cross-mode `diff` warns rather than reading a stronger mode's newly-seen host as
+drift. It is a mechanism label, never a completeness claim.
+
 ## The reproduction gate
 
 `observe::aggregate(trials, first_party)`:

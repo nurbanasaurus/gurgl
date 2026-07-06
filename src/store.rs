@@ -388,6 +388,7 @@ mod tests {
             trials: 1,
             flightplan: "fp".into(),
             gurgl_version: "0".into(),
+            capture_mode: crate::model::CaptureMode::EnvProxy,
             hosts: vec![],
         };
         assert!(
@@ -416,5 +417,24 @@ mod tests {
         store.set_baseline("srv", None).unwrap();
         assert_eq!(store.baseline("srv"), None);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn old_snapshot_without_capture_mode_loads_as_env_proxy() {
+        // A snapshot written before capture_mode existed has no such field on
+        // disk. It MUST deserialize as env-proxy - never forced, which would be a
+        // false coverage claim about a capture that predates the distinction.
+        // This is the whole back-compat story for the new field.
+        let old = r#"{
+            "server": "srv",
+            "version": "1.0.0",
+            "captured_at": 0,
+            "trials": 2,
+            "flightplan": "default-abc",
+            "gurgl_version": "0.1.0",
+            "hosts": []
+        }"#;
+        let snap: Snapshot = serde_json::from_str(old).unwrap();
+        assert_eq!(snap.capture_mode, crate::model::CaptureMode::EnvProxy);
     }
 }

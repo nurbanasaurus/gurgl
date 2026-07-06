@@ -145,7 +145,7 @@ fn sanitize(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Host, HostClass, Reproducibility, Snapshot};
+    use crate::model::{CaptureMode, Host, HostClass, Reproducibility, Snapshot};
 
     fn snap(hosts: Vec<Host>) -> Snapshot {
         Snapshot {
@@ -155,6 +155,7 @@ mod tests {
             trials: 5,
             flightplan: "fp".into(),
             gurgl_version: "0".into(),
+            capture_mode: CaptureMode::EnvProxy,
             hosts,
         }
     }

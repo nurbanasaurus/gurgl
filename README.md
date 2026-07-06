@@ -124,6 +124,15 @@ gurgl --config examples/gurgl.toml diff example-mcp
 gurgl --config examples/gurgl.toml allow example-mcp --format squid
 ```
 
+Or run the guided tour that stitches those together, plus nine more worked
+examples (vet-before-adopt, a cron drift audit, a CI gate, allowlist emission,
+a live capture) in **[examples/scripts/](examples/scripts/)** - portable bash
+for Linux and macOS:
+
+```sh
+examples/scripts/01-quickstart-demo.sh      # the whole loop on demo data, no backend
+```
+
 The `diff` demonstrates the core signal - two new **stable** hosts between 1.2.0
 and 1.3.0 (one telemetry, one **unknown**), plus an intermittent host the
 reproduction gate correctly refuses to report as a finding:
@@ -412,6 +421,7 @@ sandbox is **functional but not yet a security boundary**. See
 | [docs/INSTALL.md](docs/INSTALL.md) | Per-OS install, PATH, remote deploy, uninstall |
 | [docs/USAGE.md](docs/USAGE.md) | Every command + the config & flight-plan reference |
 | [docs/RECIPES.md](docs/RECIPES.md) | Cron/systemd/launchd audits, CI gates, jq one-liners |
+| [examples/scripts/](examples/scripts/) | Ten runnable demo scripts (Linux/macOS): quickstart, vet, drift audit, CI gate, allowlists, forensics, live capture |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | How capture, the reproduction gate, and storage work |
 | [docs/THREAT-MODEL.md](docs/THREAT-MODEL.md) | What gurgl can and cannot see - read before trusting output |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | Scope, kill criteria, the deliberate ceiling |

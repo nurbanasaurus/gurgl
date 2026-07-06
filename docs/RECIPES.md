@@ -5,6 +5,11 @@ Copy-paste automation built on gurgl's exit-code contract
 Everything here runs locally; gurgl itself never phones home, and the schedule
 is yours (cron/systemd/launchd), never a background daemon of gurgl's.
 
+Prefer ready-made scripts? Several recipes below have polished, cross-platform
+(Linux/macOS) versions in [../examples/scripts/](../examples/scripts/) - notably
+`03-weekly-drift-audit.sh` (the audit + a `--install` helper for cron/launchd)
+and `04-ci-gate.sh` (the committed-snapshot CI gate).
+
 ## The weekly drift audit (cron)
 
 Capture every configured server, compare each to its accepted baseline (else

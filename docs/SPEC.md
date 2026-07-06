@@ -48,6 +48,7 @@ certification; treating agreement with a shared capture as a pass; blocking/enfo
 |---------|------|
 | `gurgl init` | write `gurgl.toml`, create the store |
 | `gurgl watch <server> \| --all` | capture egress (N trials) and store it |
+| `gurgl plan <server>` | scaffold a DRAFT flight plan from the server's tools (never run) |
 | `gurgl list` | list captured servers/versions |
 | `gurgl show <server> [version]` | print observed hosts |
 | `gurgl diff <server> [--from --to]` | diff two versions (default: latest two) |

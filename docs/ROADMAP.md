@@ -184,6 +184,11 @@ crates (serde_json parses `package.json`; `METADATA` is a std line scan).
 
 ### 3. `gurgl plan <server>` - flight-plan scaffolding - L
 
+**Status: shipped.** `plan.rs` (pure render) + `observe::enumerate_tools`
+(no-proxy sandboxed launch) + the `build_argv(Option<&ProxyEnv>)` refactor, all
+live-verified. Note: the no-proxy launch binds the resolved `/etc/resolv.conf` so
+DNS works without the proxy (the capture path routes DNS through the proxy).
+
 **Goal.** A new subcommand launches the configured server *once* in the sandbox
 (no proxy, no capture), drives `initialize` -> `tools/list` over stdio, and writes
 a **draft** flight plan to `flightplans/<server>.toml` for human review - one

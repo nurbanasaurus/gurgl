@@ -250,6 +250,40 @@ you intend to diff. `--until-closed` catches Ctrl-C to stop cleanly, save what i
 saw, and restore the terminal (on Unix). `--for` and `--until-closed` are mutually
 exclusive.
 
+### `gurgl plan`
+
+`gurgl plan <server>` scaffolds a **draft flight plan** from what a server
+advertises. It launches the server once in the sandbox - **no capture, no proxy,
+no mitmproxy needed** - drives `initialize` + `tools/list`, and writes a draft to
+`flightplans/<server>.toml` (or `-o <file>`; refuses to overwrite without
+`--force`). The draft keeps the `initialize` / `tools/list` / idle scaffolding and
+adds one `tools/call` step per tool whose **name looks read-only** (a lexical
+heuristic, not a judgement about what the tool does), each with placeholder
+arguments typed from the tool's input schema (`"REPLACE_ME"` for strings, `0` for
+numbers, `[]` for arrays, ...).
+
+```console
+$ gurgl plan filesystem-mcp
+wrote draft flight plan: ~/.gurgl/flightplans/filesystem-mcp.toml
+  14 tool(s) advertised; 11 read-only-looking step(s) scaffolded with REPLACE_ME placeholders.
+  gurgl did NOT run it. REVIEW and fill in the placeholders, then wire it up ...
+```
+
+gurgl **never runs the draft and never fuzzes arguments** - the placeholders are
+inert, and you edit or delete each step by hand. Then point the server at it:
+
+```toml
+[[servers]]
+name = "filesystem-mcp"
+flightplan = "flightplans/filesystem-mcp.toml"
+```
+
+A generated or edited plan is a **new method**: its fingerprint differs from
+`default`, so snapshots captured under it are not comparable to default-plan
+snapshots (the draft's header says so). Enumeration still runs untrusted
+third-party code in the sandbox, so it is disclosed the same way `watch` is;
+gurgl itself makes no network call.
+
 ### `gurgl diff`
 
 `gurgl diff <server>` - compare two versions (default: the two most recent). Use

@@ -425,6 +425,163 @@ fn resolve_version(
     ("unknown".to_string(), VersionSource::Unknown)
 }
 
+/// One tool the server advertised in `tools/list`, for `gurgl plan` scaffolding.
+pub struct ToolDef {
+    pub name: String,
+    pub description: Option<String>,
+    /// The tool's JSON-Schema `inputSchema` (or Null if it declared none).
+    pub input_schema: Value,
+}
+
+/// Launch the server ONCE in the sandbox WITHOUT a proxy, drive initialize +
+/// tools/list over stdio, and return the advertised tools. Used by `gurgl plan`
+/// to scaffold a draft flight plan - it captures nothing and needs no mitmdump.
+/// gurgl makes no network call of its own; the server's own egress (e.g. npx
+/// downloading the package) is the server's, disclosed the same way `watch` does.
+pub fn enumerate_tools(cfg: &Config, spec: &ServerSpec) -> Result<Vec<ToolDef>> {
+    // Light preflight: the sandbox backend and the server's own launcher - NOT
+    // mitmdump, since enumeration runs no proxy.
+    let sandbox_bin = sandbox::required_binary(cfg.sandbox);
+    if !on_path(sandbox_bin) {
+        bail!(
+            "sandbox backend '{sandbox_bin}' not found on PATH.\n  fix: {}",
+            sandbox_fix(sandbox_bin)
+        );
+    }
+    if !on_path(&spec.command) {
+        bail!(
+            "server command '{}' not found on PATH - it is the runtime your MCP server \
+             needs (e.g. Node for npx), not a gurgl dependency.",
+            spec.command
+        );
+    }
+    if matches!(spec.command.as_str(), "npx" | "uvx" | "pipx" | "bunx") {
+        eprintln!(
+            "note: '{}' runs `{} {}` inside the sandbox to list its tools - this downloads \
+             and executes third-party code (no capture, no proxy).",
+            spec.name,
+            spec.command,
+            spec.args.join(" ")
+        );
+    }
+    // The stock filesystem server needs its allowed dir to exist; mirror capture.
+    let _ = std::fs::create_dir_all(crate::config::SCRATCH_DIR);
+
+    // Opt-in pass_env (a server may need an API key to start), minus anything
+    // reserved - the same filter capture uses.
+    let mut extra_env: Vec<(String, String)> = Vec::new();
+    for k in &spec.pass_env {
+        if is_capture_reserved(k) {
+            continue;
+        }
+        if let Ok(v) = std::env::var(k) {
+            extra_env.push((k.clone(), v));
+        }
+    }
+
+    // env=None: no CA, no proxy vars, base env - the server runs against the real
+    // network so it can start (npx download, live init), which is fine here.
+    let argv = sandbox::build_argv(cfg.sandbox, spec, None, &extra_env);
+    let scratch = ScratchDir::new(&format!("plan-{}", spec.name))?;
+    let mut cmd = Command::new(&argv[0]);
+    cmd.args(&argv[1..]);
+    if matches!(cfg.sandbox, crate::config::SandboxKind::SandboxExec) {
+        // sandbox-exec inherits this process's env, so clear it and set the base
+        // env + a writable HOME (bwrap/podman set HOME via argv instead).
+        cmd.env_clear();
+        for (k, v) in sandbox::base_env() {
+            cmd.env(k, v);
+        }
+        for (k, v) in &extra_env {
+            cmd.env(k, v);
+        }
+        cmd.env("HOME", scratch.path());
+    }
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(|| {
+            libc::setpgid(0, 0);
+            Ok(())
+        });
+    }
+    let server = cmd
+        .spawn()
+        .with_context(|| format!("spawning sandboxed '{}'", spec.command))?;
+    let mut guard = KillOnDrop::group(server);
+    let mut stdin = guard
+        .child
+        .stdin
+        .take()
+        .context("server stdin unavailable")?;
+    let stdout = guard
+        .child
+        .stdout
+        .take()
+        .context("server stdout unavailable")?;
+    let stderr_tail = drain_stderr_tail(guard.child.stderr.take());
+    let rx = spawn_line_reader(stdout);
+
+    let mut id = 1u64;
+    send(&mut stdin, &mcp::initialize(id));
+    if read_response(&rx, id, Duration::from_secs(60)).is_none() {
+        if let Ok(Some(status)) = guard.try_wait() {
+            bail!("{}", dead_server_msg(&status, "initialize", &stderr_tail));
+        }
+        let tail = stderr_tail
+            .lock()
+            .map(|g| g.iter().cloned().collect::<Vec<_>>().join("\n"))
+            .unwrap_or_default();
+        bail!(
+            "'{}' did not respond to initialize within 60s; it may need pass_env vars or \
+             network to start.{}",
+            spec.name,
+            if tail.trim().is_empty() {
+                String::new()
+            } else {
+                format!("\n  server stderr (tail):\n{tail}")
+            }
+        );
+    }
+    send(&mut stdin, &mcp::initialized());
+    id += 1;
+    send(&mut stdin, &mcp::tools_list(id));
+    let resp = read_response(&rx, id, Duration::from_secs(30)).with_context(|| {
+        format!(
+            "'{}' did not answer tools/list; cannot scaffold a plan",
+            spec.name
+        )
+    })?;
+    let tools = resp
+        .get("result")
+        .and_then(|r| r.get("tools"))
+        .and_then(|t| t.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|t| {
+                    let name = t.get("name").and_then(|n| n.as_str())?.to_string();
+                    Some(ToolDef {
+                        name,
+                        description: t
+                            .get("description")
+                            .and_then(|d| d.as_str())
+                            .map(String::from),
+                        input_schema: t.get("inputSchema").cloned().unwrap_or(Value::Null),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    drop(stdin);
+    drop(guard); // kills the server tree
+    drop(scratch);
+    Ok(tools)
+}
+
 /// Kill (and reap) a child when this guard drops, so an early return mid-trial
 /// never leaks a mitmdump or server process. When `group` is set (the sandboxed
 /// server, which pre_exec'd into its own process group), SIGKILL the whole group
@@ -686,7 +843,7 @@ fn run_trial(
             extra_env.push((k.clone(), v));
         }
     }
-    let argv = sandbox::build_argv(cfg.sandbox, spec, &penv, &extra_env);
+    let argv = sandbox::build_argv(cfg.sandbox, spec, Some(&penv), &extra_env);
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..]);
     // bwrap (--clearenv) and podman (-e only) isolate the child's environment via
@@ -1100,6 +1257,19 @@ fn phase_for(t: f64, marks: &[(f64, String)]) -> String {
 
 /// Choose a benign, read-only-looking tool to exercise. An explicit override
 /// wins; otherwise prefer read-y names and never auto-pick a destructive one.
+/// Whether a tool NAME looks state-changing under a purely lexical heuristic.
+/// This is a heuristic on the name only (never a safety verdict about the tool):
+/// `pick_benign_tool` uses it to avoid calling destructive tools during capture,
+/// and `gurgl plan` uses it to skip them when scaffolding a draft flight plan.
+pub(crate) fn tool_looks_unsafe(name: &str) -> bool {
+    const UNSAFE: &[&str] = &[
+        "delete", "remove", "write", "create", "update", "send", "exec", "run", "kill", "drop",
+        "destroy", "put", "post", "move", "rename", "publish",
+    ];
+    let l = name.to_lowercase();
+    UNSAFE.iter().any(|u| l.contains(u))
+}
+
 fn pick_benign_tool(resp: &Value, override_tool: Option<&str>) -> Option<String> {
     if let Some(t) = override_tool {
         return Some(t.to_string());
@@ -1113,22 +1283,14 @@ fn pick_benign_tool(resp: &Value, override_tool: Option<&str>) -> Option<String>
     const SAFE: &[&str] = &[
         "list", "get", "read", "search", "status", "info", "describe", "fetch", "ping",
     ];
-    const UNSAFE: &[&str] = &[
-        "delete", "remove", "write", "create", "update", "send", "exec", "run", "kill", "drop",
-        "destroy", "put", "post", "move", "rename", "publish",
-    ];
-    let is_unsafe = |n: &str| {
-        let l = n.to_lowercase();
-        UNSAFE.iter().any(|u| l.contains(u))
-    };
 
     if let Some(n) = names.iter().find(|n| {
         let l = n.to_lowercase();
-        SAFE.iter().any(|s| l.contains(s)) && !is_unsafe(n)
+        SAFE.iter().any(|s| l.contains(s)) && !tool_looks_unsafe(n)
     }) {
         return Some(n.clone());
     }
-    names.into_iter().find(|n| !is_unsafe(n))
+    names.into_iter().find(|n| !tool_looks_unsafe(n))
 }
 
 // ---- small process / IO helpers ---------------------------------------------

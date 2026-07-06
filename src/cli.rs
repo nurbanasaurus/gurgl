@@ -105,6 +105,22 @@ pub enum Commands {
         force: bool,
     },
 
+    /// Scaffold a DRAFT flight plan from a server's advertised tools. Launches the
+    /// server once (no capture, no proxy) to read tools/list, then writes a draft
+    /// with one read-only-looking tools/call step per tool and REPLACE_ME
+    /// placeholders. gurgl never runs the draft or fills real args - REVIEW it,
+    /// then wire it up via the server's `flightplan` key.
+    Plan {
+        /// Server name from gurgl.toml.
+        server: String,
+        /// Write to this file instead of flightplans/<server>.toml.
+        #[arg(long, short = 'o', value_name = "FILE")]
+        output: Option<PathBuf>,
+        /// Overwrite the draft if it already exists.
+        #[arg(long)]
+        force: bool,
+    },
+
     /// Emit an allowlist from a snapshot for an enforcement engine.
     Allow {
         server: String,

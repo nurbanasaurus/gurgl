@@ -14,6 +14,7 @@ mod mcp;
 mod model;
 mod observe;
 mod pkgver;
+mod plan;
 mod proxy;
 mod report;
 mod sandbox;
@@ -125,6 +126,11 @@ fn run() -> Result<i32> {
             as_name.as_deref(),
             *force,
         ),
+        Some(Commands::Plan {
+            server,
+            output,
+            force,
+        }) => cmd_plan(&cfg, server, output.as_deref(), *force),
         Some(Commands::Allow {
             server,
             version,
@@ -773,6 +779,70 @@ fn cmd_allow(store: &Store, server: &str, version: Option<&str>, format: &str) -
 /// verdict, guardrails baked in). JSON to stdout, or to a file with -o. The
 /// bundle carries the publishing rules IN-BAND; we ALSO surface them plus the
 /// exact host list on stderr so the exporter sees them at export time.
+/// Where `gurgl plan` writes a draft when `-o` is not given: the flightplans dir
+/// (the same one the config resolves `flightplan =` against), else
+/// `~/.gurgl/flightplans`.
+fn default_plan_path(cfg: &Config, server: &str) -> PathBuf {
+    let dir = cfg
+        .flightplan_path()
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| config::gurgl_home().join("flightplans"));
+    dir.join(format!("{server}.toml"))
+}
+
+/// `gurgl plan <server>`: enumerate the server's tools (one no-capture launch) and
+/// write a DRAFT flight plan for review. Never runs the draft, never fuzzes args.
+fn cmd_plan(cfg: &Config, server: &str, out: Option<&Path>, force: bool) -> Result<i32> {
+    let spec = cfg
+        .server(server)
+        .with_context(|| format!("server '{server}' is not configured in gurgl.toml"))?;
+    let path = match out {
+        Some(p) => p.to_path_buf(),
+        None => default_plan_path(cfg, server),
+    };
+    if path.exists() && !force {
+        bail!(
+            "{} already exists - pass --force to overwrite, or -o <path> to write elsewhere",
+            path.display()
+        );
+    }
+
+    let tools = observe::enumerate_tools(cfg, spec)?;
+    let text = plan::render_draft_plan(server, &tools);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    store::write_atomic(&path, text.as_bytes())?;
+
+    let scaffolded = tools
+        .iter()
+        .filter(|t| !t.name.is_empty() && !observe::tool_looks_unsafe(&t.name))
+        .count();
+    if tools.is_empty() {
+        eprintln!(
+            "note: no tools were enumerated - the server may need pass_env vars or network to \
+             start. Wrote a scaffolding-only draft; add tools/call steps by hand."
+        );
+    }
+    println!("wrote draft flight plan: {}", path.display());
+    println!(
+        "  {} tool(s) advertised; {scaffolded} read-only-looking step(s) scaffolded with \
+         REPLACE_ME placeholders.",
+        tools.len()
+    );
+    println!(
+        "  gurgl did NOT run it. REVIEW and fill in the placeholders, then wire it up in \
+         gurgl.toml under [[servers]] for '{server}':\n    flightplan = \"flightplans/{server}.toml\""
+    );
+    println!(
+        "  A generated or edited plan is a new method (new fingerprint): snapshots captured \
+         under it are not comparable to default-plan snapshots."
+    );
+    Ok(0)
+}
+
 fn cmd_export(
     store: &Store,
     server: &str,

@@ -89,7 +89,11 @@ Path helpers live in `config.rs` (`gurgl_home()`, `default_config_path()`,
   battery mode is an error carrying its stderr tail, never an empty snapshot -
   "no egress observed" from a dead process would be a false observation.
   `config::SCRATCH_DIR` is guaranteed at capture time (host-side + bwrap
-  `--dir`) so the starter config works out of the box.
+  `--dir`) so the starter config works out of the box. `enumerate_tools()`
+  (for `gurgl plan`) launches the server ONCE in the sandbox with NO proxy
+  (`build_argv(.., None, ..)`), drives initialize + tools/list, and returns the
+  `ToolDef`s - no capture, no mitmdump. `tool_looks_unsafe()` is the shared
+  lexical read-only heuristic (also used by `pick_benign_tool`).
 - `diff.rs` - pure `diff(from, to) -> SnapshotDiff`, plus `same_label_conflict`
   (the rug-pull guard: `Some` only when a same-version overwrite's STABLE host set
   changed, both sides ran a battery, same flight-plan fingerprint). `watch`
@@ -119,6 +123,14 @@ Path helpers live in `config.rs` (`gurgl_home()`, `default_config_path()`,
   (docs/THREAT-MODEL.md).
 - `flightplan.rs` - parse/fingerprint the scripted battery; `Step::args` (TOML
   table) lets a `tools/call` step pass real arguments, folded into the fingerprint.
+- `plan.rs` - pure `render_draft_plan()`: hand-emits a DRAFT flight-plan TOML from
+  a server's tools (via `observe::enumerate_tools`), one read-only-looking
+  `tools/call` step per tool with inert `REPLACE_ME` placeholders. gurgl NEVER
+  runs the draft or fuzzes args; the header states it is a new method (new
+  fingerprint). `gurgl plan` writes it for human review (refuses overwrite without
+  `--force`). `build_argv` takes `Option<&ProxyEnv>` for this no-proxy launch;
+  its bwrap variant binds the resolved `/etc/resolv.conf` so DNS works without the
+  proxy (capture routes DNS through the proxy instead).
 - `discover.rs` - scan known MCP client configs (Claude Desktop/Code, Cursor,
   Windsurf, Cline) *and* every `.mcp.json` under `$HOME` for configured servers;
   `--import` appends stdio ones to `gurgl.toml`. Marks each `enabled`/`bundled`/

@@ -8,6 +8,15 @@ publishing. They are not optional, and they are deliberately conservative.
 If you are not publishing named observations, none of this applies - run the
 tool locally and enjoy it.
 
+**`gurgl export` produces the artifact these rules govern.** It writes a *shared
+capture*: a scrubbed, reproduction-gated host list (stable hosts only, gurgl's
+per-host class dropped so you ship raw receipts and not characterizations, the
+capture time coarsened to a date). It even bakes a compact version of the rules
+below *into the file*, so they travel with it. But writing the file is not
+publishing - **sharing, posting, or indexing it is**, and that is the line where
+everything below becomes mandatory. The scrub makes the file safer to share; it
+does not make sharing consequence-free.
+
 ## Before you publish anything that names a vendor
 
 1. **Form an entity and carry insurance.** Publish through an LLC (or a

@@ -56,6 +56,17 @@ uploader, an error path, a paste of a URL) simply won't appear. So gurgl can
 say "observed contacting X" but never "only ever contacts X." Absence in a
 capture is **non-coverage**, not a clean bill of health.
 
+### 5. Agreement with someone else's capture
+`gurgl diff --against` compares your capture to a **shared capture** from someone
+else. Matching it proves nothing. A shared capture is one observer's
+presence-only sample under *their* flight plan - it is not a vetted or known-good
+reference, it inherits every limit above (a match is still blind to trusted-channel
+exfiltration and server-side behavior), and it may itself have *missed* a host
+under its own plan or - since it is a file a stranger authored - been curated to
+hide or invent one. gurgl therefore treats a shared capture as untrusted input and
+never lets `--against` gate (no `--check`, exit `0`/`2` only): overlap is not
+verification, and a clean comparison is not a pass.
+
 ## Fidelity caveats (things that can make a reading wrong)
 
 - **Server-side feature gates / A-B cohorts.** The same version can contact

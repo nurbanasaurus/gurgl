@@ -248,6 +248,33 @@ For a live demo with real egress, see
 no-key fetch MCP server and watch hosts stream in phase by phase, including
 redirect hops the plan never named.
 
+### Comparing notes: `gurgl export` and `diff --against`
+
+You can share a capture and compare against someone else's. `gurgl export`
+writes a **shared capture** - a scrubbed, shareable file of the *stable* hosts
+you observed:
+
+```sh
+gurgl export fetch -o fetch.shared.json     # stable hosts only; JSON to a file (or stdout)
+gurgl diff fetch --against fetch.shared.json # compare your latest capture to it
+```
+
+The export deliberately carries only raw receipts - host names, trial counts,
+phases, the flight-plan fingerprint - and **drops gurgl's per-host class**, since
+what a host *is* is the reader's call to make, not the publisher's to assert. It
+bakes the [docs/PUBLISHING.md](docs/PUBLISHING.md) guardrails into the file so
+they travel with it.
+
+`diff --against` is **exploratory, never a verdict**. A shared capture is one
+observer's presence-only sample under *their* flight plan - not a verified or
+known-good reference. Matching it is **not** a pass (a tool exfiltrating over a
+host it already contacts produces an identical set), and having more or fewer
+hosts than it is expected, not proof of anything. It takes a **local path only**
+- a file, a raw snapshot, or another gurgl store dir - and never fetches over the
+network (a URL is refused, not downloaded). A shared file is treated as untrusted
+input: size-capped, control-stripped, and re-checked against the reproduction
+gate locally.
+
 ## Where things live: `~/.gurgl`
 
 ```
@@ -298,9 +325,11 @@ Working from a source clone instead? `make update` (git pull + reinstall) and
 | `gurgl show <server> [version]` | Show observed hosts for a version (default: latest). |
 | `gurgl watch [<server>] [--all] [--for <dur>] [--until-closed] [--diff]` | Capture egress behind the proxy (needs mitmproxy + sandbox). `--diff` audits each capture against its baseline and exits 1 on drift. |
 | `gurgl diff <server> [--from --to] [--baseline] [--check[=any]]` | Diff egress between versions. `--check` exits 1 on new stable scrutiny hosts (CI/cron gates). |
+| `gurgl diff <server> --against <path>` | Compare your capture to someone else's *shared capture* (a file or another store dir). Exploratory, never a pass/fail; local path only. |
 | `gurgl ack <server> <host> [--note ...]` | Record that you reviewed a host so diff reports it quietly (also `--list`, `--remove`). |
 | `gurgl accept <server> [version]` | Mark a reviewed capture as the baseline for `--baseline` / `watch --diff`. |
 | `gurgl allow <server> [--format ...]` | Emit an allowlist (`sandbox-runtime` / `opensnitch` / `squid`). |
+| `gurgl export <server> [version] [-o file] [--as-name n] [--force]` | Write a scrubbed, shareable *shared capture* (stable hosts only, no verdict) for others to `diff --against`. Read [docs/PUBLISHING.md](docs/PUBLISHING.md) first. |
 | `gurgl update` (`-u`, `--update`) | Pull the latest source and reinstall. Runs only when invoked; no auto-update. |
 
 Global flags: `--config <path>` (else `./gurgl.toml`, else `~/.gurgl/gurgl.toml`),
@@ -309,7 +338,9 @@ versioned JSON from `list`/`show`/`diff`/`discover`, for jq and scripts).
 
 **Exit codes** are a contract: `0` = no drift at the requested threshold, `1` =
 drift detected (`diff --check`, `watch --diff`), `2` = error - so a cron line or
-CI step can gate on gurgl directly. Copy-paste automation (cron, systemd,
+CI step can gate on gurgl directly. (`diff --against` is the deliberate exception:
+it is exploratory and returns only `0` = compared or `2` = error, never `1` - a
+stranger's capture must never be a pass/fail oracle.) Copy-paste automation (cron, systemd,
 launchd, CI, jq) lives in **[docs/RECIPES.md](docs/RECIPES.md)**. Every flag,
 the config schema, and flight plans are documented in
 **[docs/USAGE.md](docs/USAGE.md)**.

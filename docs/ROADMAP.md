@@ -20,7 +20,14 @@ update an MCP server.
       timestamp. Verified end-to-end against a live server.
 - [ ] Version derivation (resolve the actual installed version of an npm/PyPI
       MCP server instead of the config label).
-- [ ] `watch` ergonomics: progress, timing, partial-capture handling.
+- [x] `watch` ergonomics: live dashboard, timing, partial-capture handling.
+- [x] **Local sharing primitives** (`gurgl export` + `gurgl diff --against`):
+      scrub a capture into a shareable *shared capture* (stable hosts only, class
+      dropped, guardrails baked in-band), and compare your capture to someone
+      else's local file/store dir. Exploratory only, never a pass/fail; local
+      path only, never a network fetch. These are the personal-tool foundation
+      the v2 catalog would build on - the file format and the consume path exist,
+      the *distribution* deliberately does not.
 
 ## v1.1 - capture hardening
 
@@ -38,7 +45,14 @@ can be published as a byproduct. This is gated on **docs/PUBLISHING.md** in full
 never shaming solo maintainers). It is not a live index, not a paid feed, not a
 "verified/safe" ranking.
 
-- [ ] Signed, versioned static dataset format.
+The **local** half already exists: `gurgl export` produces the scrubbed,
+guardrail-carrying artifact and `gurgl diff --against` consumes one. What is
+deliberately *not* built is any distribution of them - and the constraints on
+that stay hard: PATH-only consumption forever (no default/well-known catalog URL,
+no "check for a newer capture", no auto-sync endpoint), or it becomes the
+phone-home the whole tool refuses to be.
+
+- [ ] Signed, versioned static dataset format (bundling many exported captures).
 - [ ] Contribution flow for community-run flight plans.
 - [ ] Event-triggered writeups (only when materially newsworthy).
 

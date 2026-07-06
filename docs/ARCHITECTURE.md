@@ -27,8 +27,15 @@ files) touches the OS.
              per-trial host sets ─────────▶ observe::aggregate  flows.jsonl
                      │  (× N trials, reproduction gate)
                      ▼
-                  Snapshot ──▶ store.rs (JSON)  ──▶  diff.rs / emit.rs
+                  Snapshot ──▶ store.rs (JSON)  ──▶  diff.rs / emit.rs / share.rs
 ```
+
+`share.rs` is off to the side of the capture path: `gurgl export` scrubs a stored
+`Snapshot` into a shareable *shared capture* (stable hosts only, class dropped,
+guardrails baked in), and `gurgl diff --against` loads someone else's - as
+**untrusted input** (size-capped, control-stripped via `proxy::normalize_host`,
+reproduction gate re-applied locally, URL refused, never fetched) - and feeds it
+through the same `diff.rs`. It adds no network path and no new dependency.
 
 ## Why Rust + external mitmproxy
 

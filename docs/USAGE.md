@@ -5,7 +5,7 @@ first ([INSTALL.md](INSTALL.md)), then read this top to bottom once.
 
 - [Mental model](#mental-model)
 - [Global flags & config discovery](#global-flags--config-discovery)
-- [Commands](#commands): [bare gurgl / demo](#gurgl-bare-and-gurgl-demo) · [doctor](#gurgl-doctor) · [explain](#gurgl-explain) · [init](#gurgl-init) · [discover](#gurgl-discover) · [list](#gurgl-list) · [show](#gurgl-show) · [watch](#gurgl-watch) · [diff](#gurgl-diff) · [allow](#gurgl-allow) · [update](#gurgl-update)
+- [Commands](#commands): [bare gurgl / demo](#gurgl-bare-and-gurgl-demo) · [doctor](#gurgl-doctor) · [explain](#gurgl-explain) · [init](#gurgl-init) · [discover](#gurgl-discover) · [list](#gurgl-list) · [show](#gurgl-show) · [watch](#gurgl-watch) · [diff](#gurgl-diff) · [diff --against](#gurgl-diff---against-a-shared-capture) · [allow](#gurgl-allow) · [export](#gurgl-export) · [update](#gurgl-update)
 - [The config file](#the-config-file-gurgltoml)
 - [Flight plans](#flight-plans)
 - [Host classification](#host-classification)
@@ -260,6 +260,54 @@ not proof the tool won't contact it.
 Intermittent new hosts are shown but flagged as likely cohort noise, never as a
 finding.
 
+### `gurgl diff --against` (a shared capture)
+
+`gurgl diff <server> --against <path>` compares your latest **local** capture to
+someone else's **shared capture** - a file written by `gurgl export`, a raw
+snapshot, or another gurgl store directory. Use it to sanity-check your footprint
+against a peer's: "am I seeing hosts nobody else did, or missing ones they saw?"
+
+```console
+$ gurgl diff fetch --against ./fetch.shared.json
+comparing your capture of fetch@0.13.37 against a shared capture
+  source: ./fetch.shared.json [shared capture: fetch @ 0.13.37]
+  [the shared capture is one observer's presence-only sample under their own flight plan -
+   NOT a vetted or known-good reference. Having more or fewer hosts than it is expected.]
+
+  hosts YOU observed that the shared capture did not:
+    + beacon.unknown-3p.net                    [unknown]
+
+  ⚠ 1 stable host(s) here matched no known rule - worth a look. This is NOT proof
+    of wrongdoing: a different version, a server-side cohort, a different flight
+    plan, or your own tool-call arguments can all add hosts the shared capture lacks:
+    beacon.unknown-3p.net  [unknown]
+
+  hosts also present in the shared capture: 4 (overlap is not verification)
+```
+
+It is **exploratory, never a verdict**, and this is deliberate:
+
+- **Exit codes are `0` (compared) or `2` (error), never `1`.** `--check` is
+  refused with `--against`: a stranger's capture must never be a pass/fail gate
+  (that would be the "verified/clean" badge gurgl refuses to be). Wire drift gates
+  to `diff --check` / `watch --diff` against **your own** versions, not this.
+- **A match is not a pass.** If you observed nothing beyond the shared capture,
+  gurgl says so *and* restates that this is not a clean bill of health - a tool
+  exfiltrating over a host it already contacts produces an identical set
+  ([THREAT-MODEL.md](THREAT-MODEL.md)).
+- **The direction is symmetric, not authoritative.** "Hosts the shared capture
+  saw that you didn't" is a version / cohort / coverage / flight-plan difference,
+  not "you're missing something." A **flight-plan fingerprint mismatch** is called
+  out loudly, because different methods exercise different egress.
+
+`--against` takes a **local path only** and **never fetches over the network** - a
+URL is refused, not downloaded (constraint #5). A shared file is treated as
+**untrusted input**: it is size-capped, every string is control-stripped (so a
+hostile file can't corrupt your terminal), host classes are recomputed locally
+against *your* `first_party`, and the reproduction gate is re-applied locally (a
+shared file is never trusted to have been gated by its author). `--json` emits the
+versioned `gurgl.diff-against/1` schema with the caveat in its `note` field.
+
 ### `gurgl allow`
 
 `gurgl allow <server> [version] --format <fmt>` - emit an allowlist from a
@@ -276,6 +324,50 @@ $ gurgl allow filesystem-mcp --format sandbox-runtime > allow.txt
 
 An allowlist reflects only what was **observed** under the flight plan - it is a
 starting point to review, not a complete contract.
+
+### `gurgl export`
+
+`gurgl export <server> [version] [-o FILE] [--as-name NAME] [--force]` - write a
+scrubbed, shareable **shared capture** of a server's observed egress, for others
+to `diff --against`. JSON goes to stdout (so `gurgl export foo > foo.shared.json`
+works), or to a file with `-o`; the host list and review warnings go to stderr.
+
+```console
+$ gurgl export fetch -o fetch.shared.json
+shared capture of fetch @ 0.13.37 - 5 stable host(s):
+    api.github.com
+    example.com
+    ...
+review before you share (this file names a third party):
+  - server label written: 'fetch' (your local label) - it may identify you; rename with --as-name.
+  - a host reached via a tool-call ARGUMENT may be YOURS, not the tool's.
+  - a host that reveals internal infrastructure should be removed by hand.
+  - publishing named observations takes on real legal/ethical exposure ... (docs/PUBLISHING.md)
+wrote fetch.shared.json
+```
+
+What the scrub does, and why:
+
+- **Stable hosts only.** Intermittent and single-observation hosts are dropped -
+  the reproduction gate is mandatory for anything you share (a single sighting is
+  server-side noise, not a fact about the tool).
+- **No host class.** The file carries host names, trial counts, phases, and the
+  flight-plan fingerprint - **raw receipts** - but not gurgl's `first-party /
+  telemetry / unknown` inference. What a host *is* is the reader's conclusion to
+  draw, not the publisher's to assert (see [PUBLISHING.md](PUBLISHING.md); the
+  consumer recomputes class locally against their own `first_party`).
+- **Date, not timestamp.** The capture time is coarsened to `YYYY-MM-DD`.
+- **Guardrails baked in.** The publishing rules are written into the file itself,
+  so they travel with it to whoever receives or reposts it.
+
+`-o` **refuses to overwrite** an existing file unless you pass `--force` (and
+writes atomically, so a crash never leaves a half-written bundle). `--as-name`
+renames the server in the output - use it if your local label identifies you.
+
+Exporting a file is not itself publishing; **sharing or posting it is**, and that
+is what [PUBLISHING.md](PUBLISHING.md) governs (entity + insurance, coordinated
+disclosure, never punch down). A shared capture is a floor of hosts one observer
+reproduced - never a ceiling, never an allowlist, never a "this tool is safe".
 
 ### `gurgl ack`
 
@@ -324,7 +416,10 @@ see [RECIPES.md](RECIPES.md).
 versioned JSON on stdout (`gurgl.diff/1` etc.). The epistemic caveat travels in
 a `note` field; `diff` JSON carries `needs_scrutiny` (acks already subtracted)
 and `acknowledged_present` separately so scripts do not re-alert on reviewed
-hosts.
+hosts. `diff --against` emits `gurgl.diff-against/1` (carrying
+`you_saw_shared_did_not` / `shared_saw_you_did_not` and no verdict field, since
+it never gates). `gurgl export` always writes JSON, so `--json` does not apply to
+it.
 
 ```sh
 gurgl --json diff my-server | jq -r '.needs_scrutiny[]'

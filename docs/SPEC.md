@@ -33,11 +33,14 @@ own dogfooding, never the reason it exists.
 ## Scope
 
 **In:** MCP servers (npm/PyPI/container) and MCP-speaking CLIs you configure;
-host-name egress; version diffing; allowlist generation; local storage.
+host-name egress; version diffing; allowlist generation; local storage; **local**
+export/compare of a scrubbed *shared capture* (`gurgl export` / `diff --against`,
+a local file exchanged out-of-band - not a hosted service).
 
 **Out (v1):** payload inspection; GUI IDEs (ToS/automation risk); a live public
-index; a paid feed; any "verify vendor claims / is-my-code-safe" certification;
-blocking/enforcement.
+index or hosted catalog; fetching a shared capture over the network (it is
+PATH-only, by design); a paid feed; any "verify vendor claims / is-my-code-safe"
+certification; treating agreement with a shared capture as a pass; blocking/enforcement.
 
 ## Commands
 

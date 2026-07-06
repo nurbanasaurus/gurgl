@@ -50,7 +50,25 @@ gurgl --json show my-server | jq -r '.snapshot.hosts[] | select(.reproducibility
 
 # MCP servers on this machine that are actually enabled:
 gurgl --json discover | jq -r '.servers[] | select(.status=="enabled") | .name'
+
+# Hosts YOU saw that a shared capture from a peer did not (exploratory, not a gate):
+gurgl --json diff my-server --against ./peer.shared.json | jq -r '.you_saw_shared_did_not[]'
 ```
+
+## Sharing a capture with a peer
+
+`gurgl export` writes a scrubbed, shareable *shared capture* (stable hosts only,
+no verdict); `gurgl diff --against` compares yours to it. It is **exploratory,
+never a CI gate** - it returns `0`/`2` only, and `--check` is refused with
+`--against`, on purpose (a stranger's file must not decide pass/fail). Wire real
+drift gates to `diff --check` / `watch --diff` against **your own** versions.
+
+```sh
+gurgl export my-server -o my-server.shared.json     # send this file to a peer
+gurgl diff my-server --against ./their.shared.json  # compare (local path only; never fetched)
+```
+
+Read [PUBLISHING.md](PUBLISHING.md) before sharing anything that names a vendor.
 
 ## systemd timer instead of cron (Linux)
 

@@ -105,6 +105,14 @@ Path helpers live in `config.rs` (`gurgl_home()`, `default_config_path()`,
   worded "acknowledged" never "approved") and `baseline` (`gurgl accept` - the
   version a human reviewed; `diff --baseline`/`watch --diff` compare against it).
 - `sandbox.rs` / `proxy.rs` - `build_argv()` (pure, tested) + spawn helpers.
+  `ProxyEnv.sandbox_home` is a host-side dir bound as the sandbox HOME so the
+  launcher's resolved install survives teardown for `pkgver`.
+- `pkgver.rs` - pure, bounded, no-network derivation of the version a launcher
+  (npx/uvx/pipx/bunx) actually installed: `package_from_args` (argv -> package)
+  and `installed_version` (read `package.json`/`*.dist-info` under the sandbox
+  HOME). A miss returns `None` (graceful fall-through, never an error). The
+  version is resistant to a lying `serverInfo` but not to a tampering installer
+  (docs/THREAT-MODEL.md).
 - `flightplan.rs` - parse/fingerprint the scripted battery; `Step::args` (TOML
   table) lets a `tools/call` step pass real arguments, folded into the fingerprint.
 - `discover.rs` - scan known MCP client configs (Claude Desktop/Code, Cursor,
@@ -145,10 +153,15 @@ Path helpers live in `config.rs` (`gurgl_home()`, `default_config_path()`,
 ## Next tasks (v1 polish)
 
 The live capture (`observe::run_trial`) works. Remaining:
-- **Version derivation** - DONE for servers that report it: `capture()` uses the
-  MCP `initialize` response's `serverInfo.version` (precedence: config `version` >
-  server-reported > `unknown`). A server that reports no version still falls back
-  to `unknown`; deriving it from the installed npm/PyPI package is a further step.
+- **Version derivation** - DONE. `capture()` derives the version from the package
+  the launcher actually installed inside the sandbox (`pkgver`, local file reads
+  only - `package.json` for node, `*.dist-info` for python), demoting the
+  attacker-chosen `serverInfo.version` to a display-only `Snapshot.reported_version`
+  and surfacing any discrepancy. Precedence: config `version` > installed-package >
+  server-reported > `unknown`, recorded in `Snapshot.version_source`. The sandbox
+  HOME is now a host-side bind (not a tmpfs `--dir`) so the resolved package
+  survives teardown to be read. A layout gurgl doesn't recognize degrades to
+  `None` and falls back to server-reported/`unknown` - never errors a capture.
 - **Capture hardening** - force all egress through the proxy (network namespace
   + transparent redirect on Linux; a real least-privilege Seatbelt profile on
   macOS) instead of relying on the client honoring `HTTPS_PROXY`. The sandbox is

@@ -141,6 +141,16 @@ pub struct Snapshot {
     /// would be a false coverage claim.
     #[serde(default)]
     pub capture_mode: CaptureMode,
+    /// The server's self-reported `serverInfo.version`, kept for display even when
+    /// it was NOT used as the storage key (it is attacker-chosen, so a package
+    /// that reports 9.9.9 while installing as 1.2.0 is visibly discrepant). `None`
+    /// when the server reported nothing or on a snapshot predating this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_version: Option<String>,
+    /// Where `version` came from: `config`, `installed-package`, `server-reported`,
+    /// or `unknown`. `None` on a snapshot predating this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_source: Option<String>,
     pub hosts: Vec<Host>,
 }
 

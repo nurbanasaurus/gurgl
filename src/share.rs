@@ -289,6 +289,10 @@ fn shared_to_snapshot(sc: SharedCapture) -> Snapshot {
         // carry one), so default to the honest floor - never claim `forced` for
         // someone else's untrusted file.
         capture_mode: CaptureMode::EnvProxy,
+        // The export format carries no version provenance, and it would be
+        // attacker-influenced anyway - do not fabricate it for a peer's file.
+        reported_version: None,
+        version_source: None,
         hosts: sc
             .hosts
             .into_iter()
@@ -340,6 +344,11 @@ fn sanitize_and_regate(snap: Snapshot, first_party: &[String]) -> Snapshot {
         // not a third-party characterization (unlike `class`, which is dropped).
         // For a shared-capture source it is already the EnvProxy floor.
         capture_mode: snap.capture_mode,
+        // Drop version provenance from untrusted input: reported_version is
+        // attacker-influenced and version_source describes the peer's derivation,
+        // neither of which a consumer should trust or act on.
+        reported_version: None,
+        version_source: None,
         hosts,
     }
 }
@@ -383,6 +392,8 @@ mod tests {
             flightplan: "default-abc".to_string(),
             gurgl_version: "0.1.0".to_string(),
             capture_mode: CaptureMode::EnvProxy,
+            reported_version: None,
+            version_source: None,
             hosts,
         }
     }
@@ -439,6 +450,8 @@ mod tests {
             flightplan: "fp".to_string(),
             gurgl_version: "x".to_string(),
             capture_mode: CaptureMode::EnvProxy,
+            reported_version: None,
+            version_source: None,
             hosts: vec![
                 host("registry.npmjs.org", Reproducibility::Stable),
                 host("flaky.example", Reproducibility::Intermittent),

@@ -27,6 +27,11 @@ pub struct ProxyEnv {
     pub https_proxy: String,
     /// Absolute path to the lab CA cert (PEM) inside the sandbox.
     pub ca_cert_path: String,
+    /// Host-side directory bound as the sandbox HOME (`/tmp/home` inside
+    /// bwrap/podman; used directly on macOS sandbox-exec). It must survive
+    /// teardown so gurgl can read the version the launcher resolved into it (see
+    /// `pkgver`); the caller removes it after. Empty string = no home binding.
+    pub sandbox_home: String,
 }
 
 impl ProxyEnv {
@@ -154,12 +159,11 @@ fn build_bwrap_argv(
         "--ro-bind".into(),
         env.ca_cert_path.clone(),
         env.ca_cert_path.clone(),
-        // Writable, isolated scratch. HOME points inside it so npm/npx caches
-        // land in the tmpfs, not on the host.
+        // Writable, isolated scratch tmpfs for /tmp. HOME (`/tmp/home`) is mounted
+        // separately below - as a host-side bind, not a tmpfs dir, so the package
+        // the launcher resolves survives teardown for version derivation.
         "--tmpfs".into(),
         "/tmp".into(),
-        "--dir".into(),
-        "/tmp/home".into(),
         // The starter config's filesystem server needs its allowed directory to
         // exist; the tmpfs above masks any host-side /tmp/gurgl-scratch, so
         // create it inside the sandbox (the stock server exits if it's absent).
@@ -178,6 +182,19 @@ fn build_bwrap_argv(
         // reach the proxy on 127.0.0.1. Forcing *only* the proxy to be reachable
         // (netns + nftables redirect) is the roadmap hardening step.
     ];
+    // Mount HOME (/tmp/home). Bind a host-side dir when one is given so the
+    // package manager's resolved install survives teardown (pkgver reads it after
+    // the server is killed); the tmpfs above still masks the rest of /tmp. The
+    // --tmpfs /tmp above must precede this, which it does (literal first). Fall
+    // back to an in-tmpfs dir when no host home is provided (older callers/tests).
+    if env.sandbox_home.is_empty() {
+        argv.push("--dir".into());
+        argv.push("/tmp/home".into());
+    } else {
+        argv.push("--bind".into());
+        argv.push(env.sandbox_home.clone());
+        argv.push("/tmp/home".into());
+    }
     // Make user-installed language runtimes reachable. Many MCP servers run on a
     // Node/Python installed under the user's home (nvm, ~/.local, gurgl's own
     // node) rather than in /usr, and would otherwise not exist inside the
@@ -240,6 +257,15 @@ fn build_podman_argv(
         "-v".into(),
         format!("{}:{}:ro", env.ca_cert_path, env.ca_cert_path),
     ];
+    // Bind a host-side HOME so the launcher's resolved install survives teardown
+    // for version derivation (pkgver). podman sets no HOME by default, so set it
+    // explicitly to the mount point.
+    if !env.sandbox_home.is_empty() {
+        argv.push("-v".into());
+        argv.push(format!("{}:/tmp/home", env.sandbox_home));
+        argv.push("-e".into());
+        argv.push("HOME=/tmp/home".into());
+    }
     // podman does not pass host env to the container by default; -e is the only
     // way in, so nothing leaks that we do not name here.
     for (k, v) in env.vars() {
@@ -289,6 +315,7 @@ mod tests {
         ProxyEnv {
             https_proxy: "http://127.0.0.1:8080".into(),
             ca_cert_path: "/tmp/gurgl-ca.pem".into(),
+            sandbox_home: "/tmp/gurgl-home-xyz".into(),
         }
     }
 
@@ -320,6 +347,47 @@ mod tests {
             !argv.iter().any(|a| a.ends_with("/.gurgl")),
             "must not ro-bind all of ~/.gurgl"
         );
+    }
+
+    #[test]
+    fn bwrap_binds_host_home_after_tmpfs() {
+        // HOME must be a host bind (so the resolved package survives teardown for
+        // version derivation), and it must come AFTER --tmpfs /tmp or the tmpfs
+        // would mask it.
+        let argv = build_argv(SandboxKind::Bubblewrap, &spec(), &env(), &[]);
+        let bind = argv
+            .windows(3)
+            .position(|w| w[0] == "--bind" && w[1] == "/tmp/gurgl-home-xyz" && w[2] == "/tmp/home")
+            .expect("host home is bound to /tmp/home");
+        let tmpfs = argv
+            .windows(2)
+            .position(|w| w[0] == "--tmpfs" && w[1] == "/tmp")
+            .expect("/tmp tmpfs present");
+        assert!(tmpfs < bind, "--tmpfs /tmp must precede the /tmp/home bind");
+        // HOME still points at the mount point.
+        assert!(argv
+            .windows(3)
+            .any(|w| w[0] == "--setenv" && w[1] == "HOME" && w[2] == "/tmp/home"));
+    }
+
+    #[test]
+    fn bwrap_without_home_falls_back_to_tmpfs_dir() {
+        let mut e = env();
+        e.sandbox_home = String::new();
+        let argv = build_argv(SandboxKind::Bubblewrap, &spec(), &e, &[]);
+        assert!(argv
+            .windows(2)
+            .any(|w| w[0] == "--dir" && w[1] == "/tmp/home"));
+        assert!(!argv.iter().any(|a| a == "--bind"));
+    }
+
+    #[test]
+    fn podman_binds_host_home() {
+        let argv = build_argv(SandboxKind::Podman, &spec(), &env(), &[]);
+        assert!(argv
+            .windows(2)
+            .any(|w| w[0] == "-v" && w[1] == "/tmp/gurgl-home-xyz:/tmp/home"));
+        assert!(argv.iter().any(|a| a == "HOME=/tmp/home"));
     }
 
     #[test]

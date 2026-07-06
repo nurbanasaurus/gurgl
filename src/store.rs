@@ -389,6 +389,8 @@ mod tests {
             flightplan: "fp".into(),
             gurgl_version: "0".into(),
             capture_mode: crate::model::CaptureMode::EnvProxy,
+            reported_version: None,
+            version_source: None,
             hosts: vec![],
         };
         assert!(

@@ -22,7 +22,7 @@ use crate::flightplan::FlightPlan;
 use crate::model::{classify, CaptureMode, Host, HostClass, Reproducibility, Snapshot};
 use crate::proxy::{FlowHost, RawFlow};
 use crate::report::{self, Reporter};
-use crate::{mcp, proxy, sandbox};
+use crate::{mcp, pkgver, proxy, sandbox};
 
 /// How long a `watch` runs.
 #[derive(Debug, Clone, Copy)]
@@ -283,6 +283,7 @@ pub fn capture(
 
     let mut trials: Vec<Vec<FlowHost>> = Vec::with_capacity(trial_count as usize);
     let mut reported_version: Option<String> = None;
+    let mut installed_version: Option<String> = None;
     for i in 1..=trial_count {
         if stop_requested() {
             break;
@@ -292,6 +293,22 @@ pub fn capture(
             .with_context(|| format!("trial {i} of {}", spec.name))?;
         if reported_version.is_none() {
             reported_version = trial.server_version;
+        }
+        // The installed version must be consistent across the battery. If two
+        // trials resolved DIFFERENT versions, the registry re-released mid-capture
+        // and aggregating them would blend two codebases under one label - exactly
+        // what the reproduction gate exists to prevent. Bail rather than mislabel.
+        if let Some(iv) = trial.installed_version {
+            match &installed_version {
+                None => installed_version = Some(iv),
+                Some(prev) if *prev != iv => bail!(
+                    "'{}' resolved different installed versions across trials ({prev} then {iv}) - \
+                     a package re-release mid-capture would mix two codebases under one version \
+                     label; re-run the capture.",
+                    spec.name
+                ),
+                _ => {}
+            }
         }
         // A trial cut short by a stop request is discarded in battery mode: the
         // reproduction gate compares complete runs of the same plan, and a
@@ -320,17 +337,31 @@ pub fn capture(
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    // Version precedence: an explicit config value, else what the server reports
-    // in its MCP `initialize` response (`serverInfo.version`), else "unknown".
-    // A real version is what makes distinct snapshots (and therefore `diff`)
-    // possible instead of everything collapsing to unknown.json.
-    let version = spec
-        .version
-        .clone()
-        .or(reported_version)
-        .map(|v| sanitize_version(&v))
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "unknown".to_string());
+    // Version precedence: config label > the version the launcher actually
+    // installed > the server's self-reported (attacker-chosen) serverInfo.version
+    // > "unknown". Deriving from the installed package is what stops a lying
+    // serverInfo from being the storage key. See resolve_version.
+    let (version, version_source) = resolve_version(
+        spec.version.as_deref(),
+        installed_version.as_deref(),
+        reported_version.as_deref(),
+    );
+
+    // Surface a discrepancy neutrally (not an accusation): a package that
+    // self-reports one version while installing as another is worth seeing.
+    let reported_display = reported_version
+        .as_deref()
+        .map(sanitize_version)
+        .filter(|v| !v.is_empty());
+    if let (Some(inst), Some(rep)) = (installed_version.as_deref(), reported_display.as_deref()) {
+        let inst = sanitize_version(inst);
+        if !inst.is_empty() && inst != rep {
+            reporter.note(&format!(
+                "version note: '{}' self-reports {rep} but the installed package resolved to {inst}",
+                spec.name
+            ));
+        }
+    }
 
     let snapshot = Snapshot {
         server: spec.name.clone(),
@@ -343,10 +374,55 @@ pub fn capture(
         // backend (netns + transparent redirect) will stamp Forced here once it
         // lands. Stamp what was actually run, never what was requested.
         capture_mode: CaptureMode::EnvProxy,
+        reported_version: reported_display,
+        version_source: Some(version_source.as_str().to_string()),
         hosts,
     };
     reporter.finish(&snapshot);
     Ok(snapshot)
+}
+
+/// Where a snapshot's `version` came from, in precedence order.
+enum VersionSource {
+    Config,
+    InstalledPackage,
+    ServerReported,
+    Unknown,
+}
+
+impl VersionSource {
+    fn as_str(&self) -> &'static str {
+        match self {
+            VersionSource::Config => "config",
+            VersionSource::InstalledPackage => "installed-package",
+            VersionSource::ServerReported => "server-reported",
+            VersionSource::Unknown => "unknown",
+        }
+    }
+}
+
+/// Resolve the storage version and record where it came from. Precedence: an
+/// explicit config label, else the version the launcher actually installed, else
+/// the server's self-reported (attacker-chosen) serverInfo.version, else
+/// "unknown". A value that sanitizes to empty is skipped, not used. Pure.
+fn resolve_version(
+    config: Option<&str>,
+    installed: Option<&str>,
+    reported: Option<&str>,
+) -> (String, VersionSource) {
+    for (val, src) in [
+        (config, VersionSource::Config),
+        (installed, VersionSource::InstalledPackage),
+        (reported, VersionSource::ServerReported),
+    ] {
+        if let Some(v) = val {
+            let s = sanitize_version(v);
+            if !s.is_empty() {
+                return (s, src);
+            }
+        }
+    }
+    ("unknown".to_string(), VersionSource::Unknown)
 }
 
 /// Kill (and reap) a child when this guard drops, so an early return mid-trial
@@ -479,6 +555,10 @@ struct Trial {
     hosts: Vec<FlowHost>,
     /// The server's self-reported version (from `initialize`), if any.
     server_version: Option<String>,
+    /// The version the launcher actually resolved into the sandbox HOME, read
+    /// from local files after teardown (`pkgver`). `None` for a non-launcher
+    /// command or an unrecognized cache layout.
+    installed_version: Option<String>,
     /// False when a stop request cut the flight plan short mid-steps.
     completed: bool,
 }
@@ -529,6 +609,19 @@ fn run_trial(
     let addon_path = tmp.join("mitm_flows.py");
     std::fs::write(&addon_path, proxy::FLOWS_ADDON).context("writing mitm addon")?;
 
+    // The sandbox HOME is a host-side dir (inside this trial's scratch, so it is
+    // 0700 and removed on Drop with everything else). Binding it as HOME lets the
+    // package manager's resolved install land on host-readable disk that survives
+    // teardown, so pkgver can read the real installed version below.
+    let home_dir = tmp.join("home");
+    std::fs::create_dir(&home_dir)
+        .with_context(|| format!("creating sandbox home {}", home_dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&home_dir, std::fs::Permissions::from_mode(0o700));
+    }
+
     // Stable, isolated mitmproxy conf dir so the CA persists across runs.
     let confdir = mitm_confdir()?;
     std::fs::create_dir_all(&confdir).with_context(|| format!("creating {}", confdir.display()))?;
@@ -566,6 +659,7 @@ fn run_trial(
     let penv = sandbox::ProxyEnv {
         https_proxy: format!("http://127.0.0.1:{port}"),
         ca_cert_path: ca_path.to_string_lossy().to_string(),
+        sandbox_home: home_dir.to_string_lossy().to_string(),
     };
     // Forward only the env vars this server explicitly opted into (pass_env),
     // read from gurgl's own environment. The sandbox is otherwise env-cleared so
@@ -602,6 +696,12 @@ fn run_trial(
         cmd.env_clear();
         for (k, v) in &extra_env {
             cmd.env(k, v);
+        }
+        // bwrap/podman set HOME via argv; sandbox-exec's env is applied here, so
+        // point HOME at the host-side scratch home (macOS /tmp is the host's, so
+        // no bind-mount remap - HOME is the real path) for version derivation.
+        if !penv.sandbox_home.is_empty() {
+            cmd.env("HOME", &penv.sandbox_home);
         }
     }
     cmd.envs(penv.vars())
@@ -810,11 +910,18 @@ fn run_trial(
     // --- read flows, attribute each host to a phase by timestamp ---
     let raw = proxy::parse_flows(&flows_path)?;
     let hosts = attribute_phases(raw, &phase_marks);
+    // Derive the version the launcher actually resolved: read from the sandbox
+    // HOME (host bind, still populated now that the server is dead but before
+    // `scratch` drops). Local reads only; a miss is None and the caller falls
+    // back to serverInfo/unknown - a layout we don't recognize never errors.
+    let installed_version = pkgver::package_from_args(&spec.command, &spec.args)
+        .and_then(|pkg| pkgver::installed_version(&spec.command, &pkg, &home_dir));
     // `scratch` (the ScratchDir guard) removes the temp dir on drop at end of
     // scope, including every early-return above - no manual cleanup needed.
     Ok(Trial {
         hosts,
         server_version,
+        installed_version,
         completed,
     })
 }
@@ -1324,6 +1431,22 @@ mod tests {
         for name in ["GITHUB_TOKEN", "MY_API_KEY", "HOME", "LANG"] {
             assert!(!is_capture_reserved(name), "{name} should be allowed");
         }
+    }
+
+    #[test]
+    fn resolve_version_precedence() {
+        // config > installed > server-reported > unknown.
+        let (v, s) = resolve_version(Some("2.0.0"), Some("1.5.0"), Some("9.9.9"));
+        assert_eq!((v.as_str(), s.as_str()), ("2.0.0", "config"));
+        let (v, s) = resolve_version(None, Some("1.5.0"), Some("9.9.9"));
+        assert_eq!((v.as_str(), s.as_str()), ("1.5.0", "installed-package"));
+        let (v, s) = resolve_version(None, None, Some("9.9.9"));
+        assert_eq!((v.as_str(), s.as_str()), ("9.9.9", "server-reported"));
+        let (v, s) = resolve_version(None, None, None);
+        assert_eq!((v.as_str(), s.as_str()), ("unknown", "unknown"));
+        // A value that sanitizes to empty is skipped, not used as the key.
+        let (v, s) = resolve_version(Some("   "), Some("1.5.0"), None);
+        assert_eq!((v.as_str(), s.as_str()), ("1.5.0", "installed-package"));
     }
 
     #[test]

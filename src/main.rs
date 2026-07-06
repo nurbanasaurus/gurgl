@@ -13,6 +13,7 @@ mod flightplan;
 mod mcp;
 mod model;
 mod observe;
+mod pkgver;
 mod proxy;
 mod report;
 mod sandbox;
@@ -459,6 +460,20 @@ fn cmd_show(store: &Store, server: &str, version: Option<&str>, json: bool) -> R
         "{}@{}  ({} trials, flight plan {}, capture {})",
         snap.server, snap.version, snap.trials, snap.flightplan, snap.capture_mode
     );
+    // Show where the version label came from, and flag a self-reported version
+    // that disagrees with what was actually installed (a neutral observation, not
+    // an accusation - the installed value is the trustworthy storage key).
+    if let Some(src) = &snap.version_source {
+        if src != "server-reported" {
+            match &snap.reported_version {
+                Some(rep) if rep != &snap.version => println!(
+                    "  version source: {src} (server self-reports {rep}; stored under {})",
+                    snap.version
+                ),
+                _ => println!("  version source: {src}"),
+            }
+        }
+    }
     println!("{:<40} {:<12} {:<12} SEEN", "HOST", "CLASS", "REPRO");
     for h in &snap.hosts {
         println!(
@@ -2061,6 +2076,8 @@ mod tests {
             flightplan: "fp".into(),
             gurgl_version: "0".into(),
             capture_mode: CaptureMode::EnvProxy,
+            reported_version: None,
+            version_source: None,
             hosts,
         }
     }

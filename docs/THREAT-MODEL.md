@@ -80,6 +80,16 @@ verification, and a clean comparison is not a pass.
   support (enterprises demand TLS inspection), so capture works; but arbitrary
   long-tail MCP servers may pin or use non-HTTP transports and fall outside
   capture. Mark coverage gaps honestly rather than reporting silence as safety.
+- **Version label vs a tampering installer.** gurgl labels a capture with the
+  version the launcher actually *installed* (read from the package's own
+  `package.json` / `*.dist-info` inside the sandbox), not the server's
+  self-reported `serverInfo.version` - which is attacker-chosen, so a package can
+  self-report `0.2.0` while installing as `2026.7.4`. That discrepancy is
+  surfaced, and the installed value is the storage key. But those files are
+  written by the package's own install, so a hostile postinstall could rewrite
+  its own version: the derived version is resistant to a lying *server*, not
+  tamper-proof against a malicious *installer*. It is read after teardown, so no
+  live process races the read.
 
 ## Capture fidelity
 
